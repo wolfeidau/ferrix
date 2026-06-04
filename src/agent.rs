@@ -12,7 +12,7 @@ const MAX_AGENT_ITERATIONS: usize = 16;
 
 pub fn initial_history() -> Vec<ConversationMessage> {
     vec![ConversationMessage::system(
-        "You are Ferrix, a small coding agent running in a local Rust CLI. \
+        "You are Ferrix, a small coding agent. \
 Use tools when you need to inspect, modify, or run the project. \
 Prefer exact, minimal edits. The available tools are read, write, edit, and bash. \
 When you are done, respond with a concise final answer.",
