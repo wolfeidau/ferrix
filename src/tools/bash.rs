@@ -138,6 +138,7 @@ fn finish_capture(capture: &Arc<Mutex<Capture>>) -> CapturedText {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::*;

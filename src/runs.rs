@@ -73,6 +73,7 @@ fn timestamp_ms() -> u128 {
 mod tests {
     use std::fs;
 
+    use pretty_assertions::assert_eq;
     use serde_json::json;
     use uuid::Uuid;
 
