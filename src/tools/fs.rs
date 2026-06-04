@@ -112,6 +112,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use pretty_assertions::assert_eq;
     use serde_json::json;
     use uuid::Uuid;
 
