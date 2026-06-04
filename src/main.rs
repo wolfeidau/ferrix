@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
     let stdin = io::stdin();
 
     loop {
-        print!("ferrix> _");
+        print!("ferrix> ");
         io::stdout().flush().context("failed to flush prompt")?;
 
         let mut input = String::new();
