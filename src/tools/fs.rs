@@ -49,11 +49,11 @@ pub fn write_file(workspace_root: &Path, call: &ToolCall) -> Result<ToolResult> 
     let args: WriteArgs = parse_args(call)?;
     let path = resolve_path(workspace_root, &args.path);
 
-    if args.create_dirs {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create `{}`", parent.display()))?;
-        }
+    if args.create_dirs
+        && let Some(parent) = path.parent()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create `{}`", parent.display()))?;
     }
 
     fs::write(&path, &args.contents)

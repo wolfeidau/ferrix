@@ -1,0 +1,20 @@
+image: "buildkite/hosted-agent-base-images:ubuntu-jammy"
+
+steps:
+  - group: ":mag: QA"
+    key: quality_checks
+    steps:
+      - label: ":rust: Lint"
+        key: "lint"
+        commands:
+          - "cargo fmt --check"
+          - "cargo clippy --all-targets --all-features --locked  --message-format=json -- -D warnings"
+        plugins:
+          - mise#v1.1.1: ~
+
+      - label: ":rust: Test"
+        key: "test"
+        commands:
+          - "cargo test --locked"
+        plugins:
+          - mise#v1.1.1: ~
