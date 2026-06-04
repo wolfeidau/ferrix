@@ -1,20 +1,38 @@
 image: "buildkite/hosted-agent-base-images:ubuntu-jammy"
 
+cache:
+  name: "build-cache"
+  paths:
+    - "~/rustcache"
+    - "~/rustmodcache"
+    - "/mise"
+  size: "20g"
+
 steps:
   - group: ":mag: QA"
     key: quality_checks
     steps:
       - label: ":rust: Lint"
         key: "lint"
+        env:
+          CARGO_HOME: "~/rustcache"
+          CARGO_TARGET_DIR: "~/rustmodcache"
         commands:
           - "cargo fmt --check"
-          - "cargo clippy --all-targets --all-features --locked  --message-format=json -- -D warnings"
+          - cargo clippy --all-targets --all-features --locked --message-format=json -- -D warnings | clippy-sarif | tee clippy.sarif | sarif-fmt
+        artifact_paths:
+          - "clippy.sarif"
         plugins:
           - mise#v1.1.1: ~
 
       - label: ":rust: Test"
         key: "test"
+        env:
+          CARGO_HOME: "~/rustcache"
+          CARGO_TARGET_DIR: "~/rustmodcache"
         commands:
-          - "cargo test --locked"
+          - "cargo nextest run --profile ci"
+        artifact_paths:
+          - "target/nextest/ci/junit.xml"
         plugins:
           - mise#v1.1.1: ~

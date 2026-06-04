@@ -1,9 +1,13 @@
 [settings]
 experimental = true
 lockfile = true
+cargo.binstall = true
 
 [tools]
 goreleaser = "2.15.4"
 rust = "latest"
 rust-analyzer = "latest"
 sccache = "latest"
+"cargo:clippy-sarif" = "latest"
+"cargo:sarif-fmt" = "latest"
+"cargo:cargo-nextest" = "latest"
