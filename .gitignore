@@ -1,3 +1,5 @@
 /target
 .ferrix/
-/clippy.jsonl
+/dist
+/clippy.sarif
+/junit.xml
