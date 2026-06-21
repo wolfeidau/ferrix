@@ -62,6 +62,33 @@ mise trust "$PWD"
 mise install
 mise exec -- cargo fetch
 
+install_buildkite_mcp_server() {
+  local version="${BUILDKITE_MCP_SERVER_VERSION:-v1.6.1}"
+  local arch
+  case "$(uname -m)" in
+    aarch64 | arm64) arch="arm64" ;;
+    x86_64 | amd64) arch="x86_64" ;;
+    *)
+      echo "unsupported architecture for buildkite-mcp-server: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local archive="$tmpdir/buildkite-mcp-server.tar.gz"
+  local url="https://github.com/buildkite/buildkite-mcp-server/releases/download/${version}/buildkite-mcp-server_Linux_${arch}.tar.gz"
+
+  curl -fsSL "$url" -o "$archive"
+  tar -xzf "$archive" -C "$tmpdir"
+  install -m 0755 "$tmpdir/buildkite-mcp-server" "$HOME/.local/bin/buildkite-mcp-server"
+  rm -rf "$tmpdir"
+}
+
+if ! command -v buildkite-mcp-server >/dev/null 2>&1; then
+  install_buildkite_mcp_server
+fi
+
 git config --global core.sshCommand "ssh -o IdentityAgent=/agent.sock" || true
 git config --global --unset-all gpg.ssh.program || true
 

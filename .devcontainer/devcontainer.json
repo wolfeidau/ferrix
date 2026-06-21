@@ -9,6 +9,7 @@
     "OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}",
     "FERRIX_LOG": "${localEnv:FERRIX_LOG}",
     "RUST_LOG": "${localEnv:RUST_LOG}",
+    "BUILDKITE_API_TOKEN": "${localEnv:BUILDKITE_API_TOKEN}",
     "SSH_AUTH_SOCK": "/agent.sock",
     "CARGO_HOME": "/home/vscode/.cargo",
     "RUSTUP_HOME": "/home/vscode/.rustup",

@@ -1,5 +1,6 @@
 mod agent;
 mod logging;
+mod mcp;
 mod model;
 mod runs;
 mod tools;
@@ -8,6 +9,7 @@ use std::io::{self, Write};
 
 use agent::Agent;
 use anyhow::Context;
+use mcp::McpRegistry;
 use model::OpenAiCompatibleModel;
 use tools::ToolRegistry;
 
@@ -17,7 +19,8 @@ async fn main() -> anyhow::Result<()> {
 
     let workspace_root = std::env::current_dir().context("failed to determine workspace root")?;
     let model = OpenAiCompatibleModel::from_env()?;
-    let tools = ToolRegistry::new(workspace_root.clone());
+    let mcp = McpRegistry::from_workspace(&workspace_root).await?;
+    let tools = ToolRegistry::with_mcp(workspace_root.clone(), mcp);
     let agent = Agent::new(model, tools, workspace_root);
     let mut history = agent::initial_history();
 

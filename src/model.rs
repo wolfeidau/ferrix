@@ -125,22 +125,18 @@ pub struct OpenAiCompatibleModel {
 
 impl OpenAiCompatibleModel {
     pub fn from_env() -> Result<Self> {
-        let provider = std::env::var("FERRIX_MODEL_PROVIDER")
-            .unwrap_or_else(|_| "openai-compatible".to_string());
-        let model = std::env::var("FERRIX_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
-        let api_base = normalize_api_base(
-            &std::env::var("FERRIX_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-        )?;
+        let provider = env_or_default("FERRIX_MODEL_PROVIDER", "openai-compatible");
+        let model = env_or_default("FERRIX_MODEL", "gpt-5.5");
+        let api_base = normalize_api_base(&env_or_default(
+            "FERRIX_BASE_URL",
+            "https://api.openai.com/v1",
+        ))?;
         let endpoint = responses_endpoint(&api_base);
-        let api_key = std::env::var("FERRIX_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .ok();
+        let api_key = env_optional("FERRIX_API_KEY").or_else(|| env_optional("OPENAI_API_KEY"));
         let config = OpenAIConfig::new()
             .with_api_base(api_base.clone())
             .with_api_key(api_key.clone().unwrap_or_default());
-        let reasoning_effort = std::env::var("FERRIX_REASONING_EFFORT")
-            .ok()
+        let reasoning_effort = env_optional("FERRIX_REASONING_EFFORT")
             .map(|effort| parse_reasoning_effort(&effort))
             .transpose()?;
 
@@ -225,8 +221,22 @@ impl Model for OpenAiCompatibleModel {
     }
 }
 
+fn env_or_default(name: &str, default: &str) -> String {
+    env_optional(name).unwrap_or_else(|| default.to_string())
+}
+
+fn env_optional(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn normalize_api_base(base_url: &str) -> Result<String> {
     let trimmed = base_url.trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("FERRIX_BASE_URL must not be empty");
+    }
     if trimmed.ends_with("/chat/completions") {
         bail!(
             "FERRIX_BASE_URL must point to a Responses API base URL, not a chat completions endpoint"
@@ -599,6 +609,13 @@ mod tests {
                 .to_string()
                 .contains("Responses API base URL, not a chat completions endpoint")
         );
+    }
+
+    #[test]
+    fn rejects_empty_responses_api_base_url() {
+        let error = normalize_api_base("").expect_err("empty endpoint should be rejected");
+
+        assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]

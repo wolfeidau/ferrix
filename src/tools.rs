@@ -3,10 +3,12 @@ pub mod fs;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, instrument};
+
+use crate::mcp::McpRegistry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -33,14 +35,26 @@ pub struct ToolResult {
     pub data: Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ToolRegistry {
     workspace_root: PathBuf,
+    mcp: McpRegistry,
 }
 
 impl ToolRegistry {
+    #[cfg(test)]
     pub fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root }
+        Self {
+            workspace_root,
+            mcp: McpRegistry::empty(),
+        }
+    }
+
+    pub fn with_mcp(workspace_root: PathBuf, mcp: McpRegistry) -> Self {
+        Self {
+            workspace_root,
+            mcp,
+        }
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -121,16 +135,60 @@ impl ToolRegistry {
                     "additionalProperties": false
                 }),
             },
+            ToolDefinition {
+                name: "tool_search".to_string(),
+                description: "Search tools exposed by configured MCP servers.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Words to match against MCP server names, tool names, titles, and descriptions. Use an empty string to list the first tools."
+                        },
+                        "limit": {
+                            "type": ["integer", "null"],
+                            "description": "Maximum number of matches to return. Use null for the default."
+                        }
+                    },
+                    "required": ["query", "limit"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDefinition {
+                name: "mcp_call".to_string(),
+                description: "Call a tool exposed by a configured MCP server after finding it with tool_search.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "MCP server name returned by tool_search."
+                        },
+                        "tool": {
+                            "type": "string",
+                            "description": "MCP tool name returned by tool_search."
+                        },
+                        "arguments": {
+                            "type": "string",
+                            "description": "JSON object string containing arguments for the MCP tool, matching the input_schema returned by tool_search."
+                        }
+                    },
+                    "required": ["server", "tool", "arguments"],
+                    "additionalProperties": false
+                }),
+            },
         ]
     }
 
     #[instrument(skip_all, fields(tool = %call.name, call_id = %call.call_id))]
-    pub fn execute(&self, call: &ToolCall) -> ToolResult {
+    pub async fn execute(&self, call: &ToolCall) -> ToolResult {
         let result = match call.name.as_str() {
             "read" => fs::read_file(&self.workspace_root, call),
             "write" => fs::write_file(&self.workspace_root, call),
             "edit" => fs::edit_file(&self.workspace_root, call),
             "bash" => bash::run_command(&self.workspace_root, call),
+            "tool_search" => self.search_mcp_tools(call),
+            "mcp_call" => self.call_mcp_tool(call).await,
             _ => Err(anyhow::anyhow!("unknown tool `{}`", call.name)),
         };
 
@@ -151,6 +209,61 @@ impl ToolRegistry {
             }
         }
     }
+
+    fn search_mcp_tools(&self, call: &ToolCall) -> Result<ToolResult> {
+        #[derive(Deserialize)]
+        struct Args {
+            query: String,
+            limit: Option<usize>,
+        }
+
+        let args = parse_args::<Args>(call)?;
+        let output = self.mcp.search(&args.query, args.limit);
+        let data = serde_json::to_value(&output)?;
+
+        Ok(ToolResult {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            ok: true,
+            content: data.to_string(),
+            data,
+        })
+    }
+
+    async fn call_mcp_tool(&self, call: &ToolCall) -> Result<ToolResult> {
+        #[derive(Deserialize)]
+        struct Args {
+            server: String,
+            tool: String,
+            arguments: Value,
+        }
+
+        let args = parse_args::<Args>(call)?;
+        let arguments = parse_mcp_arguments(args.arguments)?;
+        let output = self.mcp.call(&args.server, &args.tool, arguments).await?;
+
+        Ok(ToolResult {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            ok: output.ok,
+            content: output.content,
+            data: output.data,
+        })
+    }
+}
+
+fn parse_mcp_arguments(arguments: Value) -> Result<Value> {
+    let arguments = match arguments {
+        Value::String(arguments) => serde_json::from_str(&arguments)
+            .context("mcp_call arguments must be a JSON object string")?,
+        arguments => arguments,
+    };
+
+    if !arguments.is_object() {
+        bail!("mcp_call arguments must decode to a JSON object");
+    }
+
+    Ok(arguments)
 }
 
 pub fn resolve_path(workspace_root: &Path, path: &str) -> PathBuf {
@@ -183,11 +296,7 @@ mod tests {
         let tools = ToolRegistry::new(std::env::temp_dir()).definitions();
 
         for tool in tools {
-            assert_eq!(
-                tool.parameters["additionalProperties"], false,
-                "{} must reject extra arguments",
-                tool.name
-            );
+            assert_strict_objects(&tool.name, &tool.parameters);
 
             let properties = tool.parameters["properties"]
                 .as_object()
@@ -209,6 +318,49 @@ mod tests {
                 "{} must require every declared property for strict mode",
                 tool.name
             );
+        }
+    }
+
+    #[test]
+    fn parses_mcp_call_arguments_from_json_string() {
+        let arguments =
+            parse_mcp_arguments(json!("{\"pipeline\":\"ferrix\"}")).expect("parse arguments");
+
+        assert_eq!(arguments["pipeline"], "ferrix");
+    }
+
+    #[test]
+    fn rejects_non_object_mcp_call_arguments() {
+        let error = parse_mcp_arguments(json!("[]")).expect_err("array rejected");
+
+        assert!(error.to_string().contains("must decode to a JSON object"));
+    }
+
+    fn assert_strict_objects(tool_name: &str, schema: &Value) {
+        let Some(object) = schema.as_object() else {
+            return;
+        };
+
+        let schema_type = object.get("type");
+        let is_object_schema = schema_type == Some(&json!("object"));
+        if is_object_schema {
+            assert_eq!(
+                object.get("additionalProperties"),
+                Some(&json!(false)),
+                "{tool_name} object schemas must reject extra arguments"
+            );
+        }
+
+        for value in object.values() {
+            match value {
+                Value::Array(values) => {
+                    for value in values {
+                        assert_strict_objects(tool_name, value);
+                    }
+                }
+                Value::Object(_) => assert_strict_objects(tool_name, value),
+                _ => {}
+            }
         }
     }
 }

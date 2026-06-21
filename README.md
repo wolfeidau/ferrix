@@ -41,6 +41,36 @@ The agent can use these local tools:
 - `write`: write full contents to a file.
 - `edit`: replace one exact text match in a file.
 - `bash`: run a shell command and stream output to the terminal.
+- `tool_search`: search tools exposed by configured MCP servers.
+- `mcp_call`: call an MCP tool found with `tool_search`.
+
+## MCP Servers
+
+Ferrix can connect to stdio MCP servers using [`rmcp`](https://crates.io/crates/rmcp). Configure servers in `.ferrix/mcp.json` at the workspace root:
+
+```json
+{
+  "servers": [
+    {
+      "name": "git",
+      "command": "uvx",
+      "args": ["mcp-server-git"],
+      "env": {},
+      "cwd": null,
+      "disabled": false
+    }
+  ]
+}
+```
+
+Ferrix loads this file at startup. If it is missing, Ferrix runs with only the built-in local tools. Each enabled server is started as a child process, initialized over stdio, and queried for its tools.
+
+MCP tools are exposed through two built-in bridge tools:
+
+- `tool_search` searches MCP server names, tool names, titles, and descriptions. Results include the server name, tool name, qualified name, description, and input schema.
+- `mcp_call` invokes a selected MCP tool with `{ "server": "...", "tool": "...", "arguments": "{\"key\":\"value\"}" }`.
+
+Use `tool_search` first to inspect the input schema, then call the selected tool with `mcp_call`. MCP tool calls and results are recorded in `.ferrix/runs/` alongside local tool activity.
 
 ## Agent Loop
 
@@ -53,7 +83,7 @@ flowchart TD
     Decision -->|"Final answer"| PrintAnswer["Print answer"]
     Decision -->|"Execution plan"| SavePlan["Store execution plan"]
     SavePlan --> ModelCall
-    Decision -->|"Tool call"| RunTool["Run local tool"]
+    Decision -->|"Tool call"| RunTool["Run local or MCP bridge tool"]
     RunTool --> ToolResult["Append and store tool result"]
     ToolResult --> ModelCall
     PrintAnswer --> CompleteRun["Finalize run artifact"]
@@ -89,6 +119,25 @@ The container uses the official Rust devcontainer image, bootstraps `mise`, inst
 ```sh
 ssh-add -l
 ```
+
+The devcontainer also downloads the [Buildkite MCP server](https://github.com/buildkite/buildkite-mcp-server) `v1.6.1` Linux release into `~/.local/bin/buildkite-mcp-server` and passes through `BUILDKITE_API_TOKEN`. To test it with Ferrix, create `.ferrix/mcp.json`:
+
+```json
+{
+  "servers": [
+    {
+      "name": "buildkite",
+      "command": "buildkite-mcp-server",
+      "args": ["stdio"],
+      "env": {},
+      "cwd": null,
+      "disabled": false
+    }
+  ]
+}
+```
+
+Set `BUILDKITE_API_TOKEN` on the host before reopening the devcontainer so it is passed through to the server.
 
 # License
 
