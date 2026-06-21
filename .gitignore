@@ -3,3 +3,4 @@
 /dist
 /clippy.sarif
 /junit.xml
+/.envrc

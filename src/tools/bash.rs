@@ -67,7 +67,7 @@ pub fn run_command(workspace_root: &Path, call: &ToolCall) -> Result<ToolResult>
     info!(?exit_code, ok, "bash command completed");
 
     Ok(ToolResult {
-        call_id: call.id.clone(),
+        call_id: call.call_id.clone(),
         name: call.name.clone(),
         ok,
         content: match exit_code {
@@ -146,7 +146,8 @@ mod tests {
     #[test]
     fn bash_streams_and_captures_output() {
         let call = ToolCall {
-            id: "call_1".to_string(),
+            call_id: "call_1".to_string(),
+            item_id: None,
             name: "bash".to_string(),
             arguments: json!({ "command": "printf ferrix" }),
         };

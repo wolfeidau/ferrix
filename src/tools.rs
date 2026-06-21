@@ -17,7 +17,9 @@ pub struct ToolDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
-    pub id: String,
+    pub call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
     pub name: String,
     pub arguments: Value,
 }
@@ -73,12 +75,11 @@ impl ToolRegistry {
                             "description": "Complete file contents."
                         },
                         "create_dirs": {
-                            "type": "boolean",
-                            "description": "Create missing parent directories before writing.",
-                            "default": false
+                            "type": ["boolean", "null"],
+                            "description": "Create missing parent directories before writing. Use null or false when parent directories must already exist."
                         }
                     },
-                    "required": ["path", "contents"],
+                    "required": ["path", "contents", "create_dirs"],
                     "additionalProperties": false
                 }),
             },
@@ -123,7 +124,7 @@ impl ToolRegistry {
         ]
     }
 
-    #[instrument(skip_all, fields(tool = %call.name, call_id = %call.id))]
+    #[instrument(skip_all, fields(tool = %call.name, call_id = %call.call_id))]
     pub fn execute(&self, call: &ToolCall) -> ToolResult {
         let result = match call.name.as_str() {
             "read" => fs::read_file(&self.workspace_root, call),
@@ -141,7 +142,7 @@ impl ToolRegistry {
             Err(error) => {
                 tracing::warn!(error = %error, "tool failed");
                 ToolResult {
-                    call_id: call.id.clone(),
+                    call_id: call.call_id.clone(),
                     name: call.name.clone(),
                     ok: false,
                     content: error.to_string(),
@@ -167,4 +168,47 @@ where
 {
     serde_json::from_value(call.arguments.clone())
         .map_err(|error| anyhow::anyhow!("invalid arguments for `{}`: {error}", call.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn tool_definitions_are_strict_schema_compatible() {
+        let tools = ToolRegistry::new(std::env::temp_dir()).definitions();
+
+        for tool in tools {
+            assert_eq!(
+                tool.parameters["additionalProperties"], false,
+                "{} must reject extra arguments",
+                tool.name
+            );
+
+            let properties = tool.parameters["properties"]
+                .as_object()
+                .expect("tool properties");
+            let required = tool.parameters["required"]
+                .as_array()
+                .expect("required tools");
+            let required = required
+                .iter()
+                .map(|value| value.as_str().expect("required string"))
+                .collect::<BTreeSet<_>>();
+            let property_names = properties
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+
+            assert_eq!(
+                required, property_names,
+                "{} must require every declared property for strict mode",
+                tool.name
+            );
+        }
+    }
 }

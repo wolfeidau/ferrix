@@ -98,6 +98,9 @@ where
                     "iteration": iteration,
                     "content": response.content.clone(),
                     "tool_call_count": response.tool_calls.len(),
+                    "tool_calls": response.tool_calls.clone(),
+                    "response_item_count": response.response_items.len(),
+                    "response_items": response.response_items.clone(),
                     "has_execution_plan": response.execution_plan.is_some()
                 }),
             )?;
@@ -106,6 +109,7 @@ where
                 history.push(ConversationMessage::assistant_tool_calls(
                     response.content.clone(),
                     response.tool_calls.clone(),
+                    response.response_items.clone(),
                 ));
                 self.execute_tool_calls(&recorder, &response.tool_calls, history)?;
                 continue;
@@ -227,15 +231,24 @@ mod tests {
             ModelResponse {
                 content: Some("tool preface".to_string()),
                 tool_calls: vec![ToolCall {
-                    id: "call_1".to_string(),
+                    call_id: "call_1".to_string(),
+                    item_id: Some("fc_1".to_string()),
                     name: "unknown".to_string(),
                     arguments: json!({}),
                 }],
+                response_items: vec![json!({
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "unknown",
+                    "arguments": "{}"
+                })],
                 execution_plan: None,
             },
             ModelResponse {
                 content: Some("final answer".to_string()),
                 tool_calls: Vec::new(),
+                response_items: Vec::new(),
                 execution_plan: None,
             },
         ]);
@@ -254,6 +267,32 @@ mod tests {
 
         assert_eq!(answer, "final answer");
         assert_eq!(streamed, "final answer");
+
+        let runs_dir = workspace.join(".ferrix").join("runs");
+        let run_file = fs::read_dir(&runs_dir)
+            .expect("read runs dir")
+            .next()
+            .expect("run file")
+            .expect("run file entry")
+            .path();
+        let run_events = fs::read_to_string(run_file).expect("read run events");
+        let tool_response_event = run_events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse event"))
+            .find(|event| {
+                event["kind"] == "model_response"
+                    && event["payload"]["tool_call_count"].as_u64() == Some(1)
+            })
+            .expect("tool response event");
+
+        assert_eq!(
+            tool_response_event["payload"]["tool_calls"][0]["call_id"],
+            "call_1"
+        );
+        assert_eq!(
+            tool_response_event["payload"]["response_items"][0]["type"],
+            "function_call"
+        );
 
         fs::remove_dir_all(workspace).expect("remove workspace");
     }

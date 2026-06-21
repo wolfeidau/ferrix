@@ -5,8 +5,8 @@ use async_openai::{
     types::responses::{
         CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
         FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem, InputParam, Item,
-        OutputItem, OutputStatus, ResponseStreamEvent, Role, Tool, ToolChoiceOptions,
-        ToolChoiceParam,
+        OutputItem, OutputStatus, Reasoning, ReasoningEffort, ResponseStreamEvent, Role, Tool,
+        ToolChoiceOptions, ToolChoiceParam,
     },
 };
 use futures_util::StreamExt;
@@ -23,6 +23,8 @@ pub struct ConversationMessage {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_items: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
@@ -33,6 +35,7 @@ impl ConversationMessage {
             role: "system".to_string(),
             content: Some(content.into()),
             tool_calls: Vec::new(),
+            response_items: Vec::new(),
             tool_call_id: None,
         }
     }
@@ -42,6 +45,7 @@ impl ConversationMessage {
             role: "user".to_string(),
             content: Some(content.into()),
             tool_calls: Vec::new(),
+            response_items: Vec::new(),
             tool_call_id: None,
         }
     }
@@ -51,15 +55,21 @@ impl ConversationMessage {
             role: "assistant".to_string(),
             content: Some(content.into()),
             tool_calls: Vec::new(),
+            response_items: Vec::new(),
             tool_call_id: None,
         }
     }
 
-    pub fn assistant_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
+    pub fn assistant_tool_calls(
+        content: Option<String>,
+        tool_calls: Vec<ToolCall>,
+        response_items: Vec<Value>,
+    ) -> Self {
         Self {
             role: "assistant".to_string(),
             content,
             tool_calls,
+            response_items,
             tool_call_id: None,
         }
     }
@@ -69,6 +79,7 @@ impl ConversationMessage {
             role: "tool".to_string(),
             content: Some(content.into()),
             tool_calls: Vec::new(),
+            response_items: Vec::new(),
             tool_call_id: Some(call_id.into()),
         }
     }
@@ -85,6 +96,7 @@ pub struct ModelMetadata {
 pub struct ModelResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    pub response_items: Vec<Value>,
     pub execution_plan: Option<Value>,
 }
 
@@ -107,13 +119,14 @@ pub struct OpenAiCompatibleModel {
     api_base: String,
     endpoint: String,
     api_key: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl OpenAiCompatibleModel {
     pub fn from_env() -> Result<Self> {
         let provider = std::env::var("FERRIX_MODEL_PROVIDER")
             .unwrap_or_else(|_| "openai-compatible".to_string());
-        let model = std::env::var("FERRIX_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_string());
+        let model = std::env::var("FERRIX_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
         let api_base = normalize_api_base(
             &std::env::var("FERRIX_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
@@ -125,6 +138,10 @@ impl OpenAiCompatibleModel {
         let config = OpenAIConfig::new()
             .with_api_base(api_base.clone())
             .with_api_key(api_key.clone().unwrap_or_default());
+        let reasoning_effort = std::env::var("FERRIX_REASONING_EFFORT")
+            .ok()
+            .map(|effort| parse_reasoning_effort(&effort))
+            .transpose()?;
 
         Ok(Self {
             client: Client::with_config(config),
@@ -133,6 +150,7 @@ impl OpenAiCompatibleModel {
             api_base,
             endpoint,
             api_key,
+            reasoning_effort,
         })
     }
 
@@ -149,6 +167,10 @@ impl OpenAiCompatibleModel {
                 .then_some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto)),
             stream: Some(true),
             store: Some(false),
+            reasoning: self.reasoning_effort.clone().map(|effort| Reasoning {
+                effort: Some(effort),
+                ..Default::default()
+            }),
             ..Default::default()
         })
     }
@@ -225,6 +247,20 @@ fn responses_endpoint(base_url: &str) -> String {
     }
 }
 
+fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(ReasoningEffort::None),
+        "minimal" => Ok(ReasoningEffort::Minimal),
+        "low" => Ok(ReasoningEffort::Low),
+        "medium" => Ok(ReasoningEffort::Medium),
+        "high" => Ok(ReasoningEffort::High),
+        "xhigh" => Ok(ReasoningEffort::Xhigh),
+        other => bail!(
+            "invalid FERRIX_REASONING_EFFORT `{other}`; expected one of none, minimal, low, medium, high, xhigh"
+        ),
+    }
+}
+
 fn response_input_items(messages: &[ConversationMessage]) -> Result<Vec<InputItem>> {
     let mut items = Vec::new();
     for message in messages {
@@ -251,13 +287,27 @@ fn response_input_items_for_message(message: &ConversationMessage) -> Result<Vec
                 items.push(easy_message(Role::Assistant, content.clone()));
             }
 
-            items.extend(
-                message
-                    .tool_calls
-                    .iter()
-                    .map(response_function_call_item)
-                    .map(InputItem::Item),
-            );
+            if !message.response_items.is_empty() {
+                items.extend(
+                    message
+                        .response_items
+                        .iter()
+                        .cloned()
+                        .map(serde_json::from_value::<Item>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .context("failed to parse stored response item")?
+                        .into_iter()
+                        .map(InputItem::Item),
+                );
+            } else {
+                items.extend(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(response_function_call_item)
+                        .map(InputItem::Item),
+                );
+            }
 
             Ok(items)
         }
@@ -287,8 +337,8 @@ fn easy_message(role: Role, content: String) -> InputItem {
 
 fn response_function_call_item(call: &ToolCall) -> Item {
     Item::FunctionCall(FunctionToolCall {
-        call_id: call.id.clone(),
-        id: Some(call.id.clone()),
+        call_id: call.call_id.clone(),
+        id: call.item_id.clone(),
         name: call.name.clone(),
         namespace: None,
         arguments: call.arguments.to_string(),
@@ -301,7 +351,7 @@ fn response_tool(tool: &ToolDefinition) -> Tool {
         name: tool.name.clone(),
         description: Some(tool.description.clone()),
         parameters: Some(tool.parameters.clone()),
-        strict: Some(false),
+        strict: Some(true),
         defer_loading: None,
     })
 }
@@ -310,6 +360,7 @@ fn response_tool(tool: &ToolDefinition) -> Tool {
 struct StreamAccumulator {
     content: String,
     tool_calls: Vec<PartialToolCall>,
+    response_items: Vec<Value>,
     execution_plans: Vec<Value>,
 }
 
@@ -337,7 +388,7 @@ impl StreamAccumulator {
                 if let Some(name) = event.name {
                     tool_call.name = name;
                 }
-                tool_call.id.get_or_insert(event.item_id);
+                tool_call.item_id.get_or_insert(event.item_id);
                 tool_call.arguments = event.arguments;
             }
             ResponseStreamEvent::ResponseOutputItemAdded(event) => {
@@ -365,12 +416,27 @@ impl StreamAccumulator {
     }
 
     fn apply_output_item(&mut self, output_index: u32, item: OutputItem) {
+        if matches!(item, OutputItem::FunctionCall(_) | OutputItem::Reasoning(_))
+            && let Ok(value) = serde_json::to_value(&item)
+        {
+            self.store_response_item(output_index, response_item_for_input(value));
+        }
+
         if let OutputItem::FunctionCall(call) = item {
             let tool_call = self.partial_tool_call(output_index);
-            tool_call.id.get_or_insert(call.call_id);
+            tool_call.call_id.get_or_insert(call.call_id);
+            tool_call.item_id = call.id;
             tool_call.name = call.name;
             tool_call.arguments = call.arguments;
         }
+    }
+
+    fn store_response_item(&mut self, output_index: u32, item: Value) {
+        let index = output_index as usize;
+        if self.response_items.len() <= index {
+            self.response_items.resize(index + 1, Value::Null);
+        }
+        self.response_items[index] = item;
     }
 
     fn partial_tool_call(&mut self, output_index: u32) -> &mut PartialToolCall {
@@ -398,6 +464,11 @@ impl StreamAccumulator {
         Ok(ModelResponse {
             content,
             tool_calls,
+            response_items: self
+                .response_items
+                .into_iter()
+                .filter(|item| !item.is_null())
+                .collect(),
             execution_plan: execution_plan_from_many(self.execution_plans),
         })
     }
@@ -405,7 +476,8 @@ impl StreamAccumulator {
 
 #[derive(Default)]
 struct PartialToolCall {
-    id: Option<String>,
+    call_id: Option<String>,
+    item_id: Option<String>,
     name: String,
     arguments: String,
 }
@@ -420,7 +492,8 @@ impl PartialToolCall {
         };
 
         Ok(ToolCall {
-            id: self.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            call_id: self.call_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            item_id: self.item_id,
             name: self.name,
             arguments,
         })
@@ -461,6 +534,13 @@ fn collect_execution_plans(value: &Value, plans: &mut Vec<Value>) {
         }
         _ => {}
     }
+}
+
+fn response_item_for_input(mut item: Value) -> Value {
+    if let Value::Object(object) = &mut item {
+        object.remove("id");
+    }
+    item
 }
 
 #[cfg(test)]
@@ -518,6 +598,7 @@ mod tests {
             api_base: "https://api.openai.com/v1".to_string(),
             endpoint: "https://api.openai.com/v1/responses".to_string(),
             api_key: Some("test".to_string()),
+            reasoning_effort: None,
         };
 
         let request = model
@@ -529,15 +610,123 @@ mod tests {
     }
 
     #[test]
+    fn parses_reasoning_effort_values() {
+        assert_eq!(
+            parse_reasoning_effort("none").unwrap(),
+            ReasoningEffort::None
+        );
+        assert_eq!(
+            parse_reasoning_effort("minimal").unwrap(),
+            ReasoningEffort::Minimal
+        );
+        assert_eq!(parse_reasoning_effort("low").unwrap(), ReasoningEffort::Low);
+        assert_eq!(
+            parse_reasoning_effort("medium").unwrap(),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            parse_reasoning_effort("HIGH").unwrap(),
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            parse_reasoning_effort("xhigh").unwrap(),
+            ReasoningEffort::Xhigh
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_reasoning_effort_value() {
+        let error =
+            parse_reasoning_effort("maximum").expect_err("invalid reasoning effort should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid FERRIX_REASONING_EFFORT")
+        );
+    }
+
+    #[test]
+    fn response_request_sets_configured_reasoning_effort() {
+        let model = OpenAiCompatibleModel {
+            client: Client::with_config(OpenAIConfig::new().with_api_key("test")),
+            provider: "test".to_string(),
+            model: "gpt-test".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            endpoint: "https://api.openai.com/v1/responses".to_string(),
+            api_key: Some("test".to_string()),
+            reasoning_effort: Some(ReasoningEffort::Low),
+        };
+
+        let request = model
+            .response_request(&[ConversationMessage::user("hello")], &[])
+            .expect("build request");
+
+        assert_eq!(
+            request.reasoning.and_then(|reasoning| reasoning.effort),
+            Some(ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn response_request_enables_strict_function_tools() {
+        let model = OpenAiCompatibleModel {
+            client: Client::with_config(OpenAIConfig::new().with_api_key("test")),
+            provider: "test".to_string(),
+            model: "gpt-test".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            endpoint: "https://api.openai.com/v1/responses".to_string(),
+            api_key: Some("test".to_string()),
+            reasoning_effort: None,
+        };
+        let tools = vec![ToolDefinition {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        }];
+
+        let request = model
+            .response_request(&[ConversationMessage::user("hello")], &tools)
+            .expect("build request");
+        let tools = request.tools.expect("tools");
+
+        assert!(matches!(
+            &tools[0],
+            Tool::Function(tool) if tool.strict == Some(true)
+        ));
+    }
+
+    #[test]
+    fn strips_response_item_ids_before_replay() {
+        let item = response_item_for_input(json!({
+            "type": "reasoning",
+            "id": "rs_123",
+            "summary": []
+        }));
+
+        assert_eq!(item["type"], "reasoning");
+        assert!(item.get("id").is_none());
+    }
+
+    #[test]
     fn builds_response_input_items_for_tool_round() {
         let messages = vec![
             ConversationMessage::assistant_tool_calls(
                 None,
                 vec![ToolCall {
-                    id: "call_1".to_string(),
+                    call_id: "call_1".to_string(),
+                    item_id: Some("fc_1".to_string()),
                     name: "read".to_string(),
                     arguments: json!({ "path": "src/main.rs" }),
                 }],
+                Vec::new(),
             ),
             ConversationMessage::tool_result("call_1", "{\"ok\":true}"),
         ];
@@ -614,9 +803,14 @@ mod tests {
 
         let response = accumulator.finish().expect("finish response");
 
-        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].call_id, "call_1");
+        assert_eq!(response.tool_calls[0].item_id.as_deref(), Some("item_1"));
         assert_eq!(response.tool_calls[0].name, "read");
         assert_eq!(response.tool_calls[0].arguments["path"], "src/main.rs");
+        assert_eq!(response.response_items.len(), 1);
+        assert_eq!(response.response_items[0]["type"], "function_call");
+        assert_eq!(response.response_items[0]["call_id"], "call_1");
+        assert!(response.response_items[0].get("id").is_none());
     }
 
     #[test]

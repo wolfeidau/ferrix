@@ -12,11 +12,18 @@ Ferrix is configured with environment variables:
 
 ```sh
 export FERRIX_API_KEY="..."
-export FERRIX_MODEL="gpt-4.1-mini"
+export FERRIX_MODEL="gpt-5.5"
+export FERRIX_REASONING_EFFORT="low"
 export FERRIX_BASE_URL="https://api.openai.com/v1"
 ```
 
-Ferrix calls the `/responses` endpoint under `FERRIX_BASE_URL`. You can set `FERRIX_BASE_URL` to either the API base, such as `https://api.openai.com/v1`, or the full Responses endpoint, such as `https://api.openai.com/v1/responses`. `OPENAI_API_KEY` is also accepted if `FERRIX_API_KEY` is not set. `FERRIX_MODEL_PROVIDER` is recorded in run metadata and defaults to `openai-compatible`.
+| Variable | Required | Description |
+| --- | --- | --- |
+| `FERRIX_API_KEY` | Yes | API key used for model requests. `OPENAI_API_KEY` is accepted as a fallback. |
+| `FERRIX_MODEL` | No | Model name. Defaults to `gpt-5.5`. |
+| `FERRIX_REASONING_EFFORT` | No | Optional reasoning effort for models that support it. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`. If unset, Ferrix uses the model default. |
+| `FERRIX_BASE_URL` | No | Responses API base URL. Defaults to `https://api.openai.com/v1`. Ferrix appends `/responses`; a full `/responses` endpoint is also accepted. |
+| `FERRIX_MODEL_PROVIDER` | No | Provider label recorded in run metadata. Defaults to `openai-compatible`. |
 
 ## Usage
 
