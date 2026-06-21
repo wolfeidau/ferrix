@@ -1,6 +1,6 @@
 # Ferrix
 
-Ferrix is a small Rust coding-agent CLI. It runs an interactive prompt, sends each user turn to an OpenAI-compatible model API, and lets the model call local tools for reading, writing, editing, and running shell commands.
+Ferrix is a small Rust coding-agent CLI. It runs an interactive prompt, sends each user turn to an OpenAI-compatible Responses API, and lets the model call local tools for reading, writing, editing, and running shell commands.
 
 ```text
 ferrix> _
@@ -16,7 +16,7 @@ export FERRIX_MODEL="gpt-4.1-mini"
 export FERRIX_BASE_URL="https://api.openai.com/v1"
 ```
 
-`OPENAI_API_KEY` is also accepted if `FERRIX_API_KEY` is not set. `FERRIX_MODEL_PROVIDER` is recorded in run metadata and defaults to `openai-compatible`.
+Ferrix calls the `/responses` endpoint under `FERRIX_BASE_URL`. You can set `FERRIX_BASE_URL` to either the API base, such as `https://api.openai.com/v1`, or the full Responses endpoint, such as `https://api.openai.com/v1/responses`. `OPENAI_API_KEY` is also accepted if `FERRIX_API_KEY` is not set. `FERRIX_MODEL_PROVIDER` is recorded in run metadata and defaults to `openai-compatible`.
 
 ## Usage
 

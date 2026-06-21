@@ -117,7 +117,7 @@ impl OpenAiCompatibleModel {
         let api_base = normalize_api_base(
             &std::env::var("FERRIX_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-        );
+        )?;
         let endpoint = responses_endpoint(&api_base);
         let api_key = std::env::var("FERRIX_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
@@ -148,6 +148,7 @@ impl OpenAiCompatibleModel {
             tool_choice: (!tools.is_empty())
                 .then_some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto)),
             stream: Some(true),
+            store: Some(false),
             ..Default::default()
         })
     }
@@ -201,13 +202,18 @@ impl Model for OpenAiCompatibleModel {
     }
 }
 
-fn normalize_api_base(base_url: &str) -> String {
+fn normalize_api_base(base_url: &str) -> Result<String> {
     let trimmed = base_url.trim_end_matches('/');
-    trimmed
-        .strip_suffix("/chat/completions")
-        .or_else(|| trimmed.strip_suffix("/responses"))
+    if trimmed.ends_with("/chat/completions") {
+        bail!(
+            "FERRIX_BASE_URL must point to a Responses API base URL, not a chat completions endpoint"
+        );
+    }
+
+    Ok(trimmed
+        .strip_suffix("/responses")
         .unwrap_or(trimmed)
-        .to_string()
+        .to_string())
 }
 
 fn responses_endpoint(base_url: &str) -> String {
@@ -472,6 +478,60 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn normalizes_responses_api_base_url() {
+        let base = normalize_api_base("https://api.openai.com/v1").expect("normalize base");
+
+        assert_eq!(base, "https://api.openai.com/v1");
+        assert_eq!(
+            responses_endpoint(&base),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn normalizes_responses_endpoint_url() {
+        let base =
+            normalize_api_base("https://api.openai.com/v1/responses").expect("normalize endpoint");
+
+        assert_eq!(base, "https://api.openai.com/v1");
+        assert_eq!(
+            responses_endpoint(&base),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn rejects_chat_completions_endpoint_url() {
+        let error = normalize_api_base("https://api.openai.com/v1/chat/completions")
+            .expect_err("chat completions endpoint should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Responses API base URL, not a chat completions endpoint")
+        );
+    }
+
+    #[test]
+    fn response_request_disables_remote_storage() {
+        let model = OpenAiCompatibleModel {
+            client: Client::with_config(OpenAIConfig::new().with_api_key("test")),
+            provider: "test".to_string(),
+            model: "gpt-test".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            endpoint: "https://api.openai.com/v1/responses".to_string(),
+            api_key: Some("test".to_string()),
+        };
+
+        let request = model
+            .response_request(&[ConversationMessage::user("hello")], &[])
+            .expect("build request");
+
+        assert_eq!(request.stream, Some(true));
+        assert_eq!(request.store, Some(false));
+    }
 
     #[test]
     fn builds_response_input_items_for_tool_round() {

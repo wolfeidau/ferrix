@@ -31,7 +31,7 @@ Ferrix is a small Rust coding-agent CLI. Keep changes focused on the current sha
 
 ## Model Configuration
 
-- The default backend is OpenAI-compatible HTTP chat completions.
+- The default backend is the OpenAI-compatible HTTP Responses API.
 - Configuration comes from `FERRIX_MODEL_PROVIDER`, `FERRIX_MODEL`, `FERRIX_BASE_URL`, and `FERRIX_API_KEY`; `OPENAI_API_KEY` is accepted as a fallback.
 - Do not hard-code secrets, model keys, or user-specific endpoints.
 
