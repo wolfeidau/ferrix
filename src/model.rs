@@ -346,11 +346,6 @@ impl StreamAccumulator {
             ResponseStreamEvent::ResponseOutputItemDone(event) => {
                 self.apply_output_item(event.output_index, event.item);
             }
-            ResponseStreamEvent::ResponseCompleted(event) => {
-                if let Ok(value) = serde_json::to_value(&event.response) {
-                    collect_execution_plans(&value, &mut self.execution_plans);
-                }
-            }
             ResponseStreamEvent::ResponseFailed(event) => {
                 bail!("model response failed: {:?}", event.response.error);
             }

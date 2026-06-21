@@ -72,9 +72,13 @@ where
                 }),
             )?;
 
+            let mut streamed_text = String::new();
             let response = self
                 .model
-                .complete_streaming(history, &tool_definitions, &mut on_text_delta)
+                .complete_streaming(history, &tool_definitions, &mut |delta| {
+                    streamed_text.push_str(delta);
+                    Ok(())
+                })
                 .await
                 .context("model completion failed")?;
 
@@ -108,6 +112,9 @@ where
             }
 
             let answer = response.content.unwrap_or_default();
+            if !streamed_text.is_empty() {
+                on_text_delta(&streamed_text)?;
+            }
             history.push(ConversationMessage::assistant(answer.clone()));
             recorder.record(
                 "run_completed",
@@ -152,5 +159,102 @@ where
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::sync::Mutex;
+
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::model::{ModelMetadata, ModelResponse};
+    use crate::tools::ToolDefinition;
+
+    #[derive(Debug)]
+    struct MockModel {
+        responses: Mutex<VecDeque<ModelResponse>>,
+    }
+
+    impl MockModel {
+        fn new(responses: impl IntoIterator<Item = ModelResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+            }
+        }
+    }
+
+    impl Model for MockModel {
+        fn metadata(&self) -> ModelMetadata {
+            ModelMetadata {
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                endpoint: "test".to_string(),
+            }
+        }
+
+        async fn complete_streaming(
+            &self,
+            _messages: &[ConversationMessage],
+            _tools: &[ToolDefinition],
+            on_text_delta: &mut dyn FnMut(&str) -> Result<()>,
+        ) -> Result<ModelResponse> {
+            let response = self
+                .responses
+                .lock()
+                .expect("lock responses")
+                .pop_front()
+                .expect("mock response");
+
+            if let Some(content) = &response.content {
+                on_text_delta(content)?;
+            }
+
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn suppresses_streamed_text_from_tool_call_iterations() {
+        let workspace = std::env::temp_dir().join(format!("ferrix-agent-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let model = MockModel::new([
+            ModelResponse {
+                content: Some("tool preface".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "unknown".to_string(),
+                    arguments: json!({}),
+                }],
+                execution_plan: None,
+            },
+            ModelResponse {
+                content: Some("final answer".to_string()),
+                tool_calls: Vec::new(),
+                execution_plan: None,
+            },
+        ]);
+        let tools = ToolRegistry::new(workspace.clone());
+        let agent = Agent::new(model, tools, workspace.clone());
+        let mut history = initial_history();
+        let mut streamed = String::new();
+
+        let answer = agent
+            .run_turn("hello", &mut history, |delta| {
+                streamed.push_str(delta);
+                Ok(())
+            })
+            .await
+            .expect("run turn");
+
+        assert_eq!(answer, "final answer");
+        assert_eq!(streamed, "final answer");
+
+        fs::remove_dir_all(workspace).expect("remove workspace");
     }
 }
