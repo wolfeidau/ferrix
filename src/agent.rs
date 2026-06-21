@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -73,6 +74,7 @@ where
             )?;
 
             let mut streamed_text = String::new();
+            let model_started = Instant::now();
             let response = self
                 .model
                 .complete_streaming(history, &tool_definitions, &mut |delta| {
@@ -81,6 +83,7 @@ where
                 })
                 .await
                 .context("model completion failed")?;
+            let model_duration_ms = model_started.elapsed().as_millis();
 
             if let Some(plan) = &response.execution_plan {
                 recorder.record(
@@ -101,6 +104,8 @@ where
                     "tool_calls": response.tool_calls.clone(),
                     "response_item_count": response.response_items.len(),
                     "response_items": response.response_items.clone(),
+                    "duration_ms": model_duration_ms,
+                    "usage": response.usage.clone(),
                     "has_execution_plan": response.execution_plan.is_some()
                 }),
             )?;
@@ -243,12 +248,18 @@ mod tests {
                     "name": "unknown",
                     "arguments": "{}"
                 })],
+                usage: Some(json!({
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15
+                })),
                 execution_plan: None,
             },
             ModelResponse {
                 content: Some("final answer".to_string()),
                 tool_calls: Vec::new(),
                 response_items: Vec::new(),
+                usage: None,
                 execution_plan: None,
             },
         ]);
@@ -293,6 +304,12 @@ mod tests {
             tool_response_event["payload"]["response_items"][0]["type"],
             "function_call"
         );
+        assert!(
+            tool_response_event["payload"]["duration_ms"]
+                .as_u64()
+                .is_some()
+        );
+        assert_eq!(tool_response_event["payload"]["usage"]["total_tokens"], 15);
 
         fs::remove_dir_all(workspace).expect("remove workspace");
     }

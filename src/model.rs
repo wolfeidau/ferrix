@@ -97,6 +97,7 @@ pub struct ModelResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub response_items: Vec<Value>,
+    pub usage: Option<Value>,
     pub execution_plan: Option<Value>,
 }
 
@@ -361,6 +362,7 @@ struct StreamAccumulator {
     content: String,
     tool_calls: Vec<PartialToolCall>,
     response_items: Vec<Value>,
+    usage: Option<Value>,
     execution_plans: Vec<Value>,
 }
 
@@ -396,6 +398,11 @@ impl StreamAccumulator {
             }
             ResponseStreamEvent::ResponseOutputItemDone(event) => {
                 self.apply_output_item(event.output_index, event.item);
+            }
+            ResponseStreamEvent::ResponseCompleted(event) => {
+                if let Some(usage) = event.response.usage {
+                    self.set_usage(usage);
+                }
             }
             ResponseStreamEvent::ResponseFailed(event) => {
                 bail!("model response failed: {:?}", event.response.error);
@@ -439,6 +446,10 @@ impl StreamAccumulator {
         self.response_items[index] = item;
     }
 
+    fn set_usage(&mut self, usage: impl Serialize) {
+        self.usage = serde_json::to_value(usage).ok();
+    }
+
     fn partial_tool_call(&mut self, output_index: u32) -> &mut PartialToolCall {
         let index = output_index as usize;
         if self.tool_calls.len() <= index {
@@ -469,6 +480,7 @@ impl StreamAccumulator {
                 .into_iter()
                 .filter(|item| !item.is_null())
                 .collect(),
+            usage: self.usage,
             execution_plan: execution_plan_from_many(self.execution_plans),
         })
     }
@@ -713,6 +725,25 @@ mod tests {
 
         assert_eq!(item["type"], "reasoning");
         assert!(item.get("id").is_none());
+    }
+
+    #[test]
+    fn includes_usage_from_completed_stream() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator
+            .apply_event(text_delta_event("done"), &mut |_| Ok(()))
+            .expect("text delta");
+        accumulator.set_usage(json!({
+            "input_tokens": 12,
+            "input_tokens_details": { "cached_tokens": 3 },
+            "output_tokens": 7,
+            "output_tokens_details": { "reasoning_tokens": 4 },
+            "total_tokens": 19
+        }));
+
+        let response = accumulator.finish().expect("finish response");
+
+        assert_eq!(response.usage.unwrap()["total_tokens"], 19);
     }
 
     #[test]
