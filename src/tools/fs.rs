@@ -16,8 +16,7 @@ struct ReadArgs {
 struct WriteArgs {
     path: String,
     contents: String,
-    #[serde(default)]
-    create_dirs: bool,
+    create_dirs: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,7 +33,7 @@ pub fn read_file(workspace_root: &Path, call: &ToolCall) -> Result<ToolResult> {
         .with_context(|| format!("failed to read UTF-8 file `{}`", path.display()))?;
 
     Ok(ToolResult {
-        call_id: call.id.clone(),
+        call_id: call.call_id.clone(),
         name: call.name.clone(),
         ok: true,
         content: contents.clone(),
@@ -49,7 +48,7 @@ pub fn write_file(workspace_root: &Path, call: &ToolCall) -> Result<ToolResult> 
     let args: WriteArgs = parse_args(call)?;
     let path = resolve_path(workspace_root, &args.path);
 
-    if args.create_dirs
+    if args.create_dirs.unwrap_or(false)
         && let Some(parent) = path.parent()
     {
         fs::create_dir_all(parent)
@@ -60,7 +59,7 @@ pub fn write_file(workspace_root: &Path, call: &ToolCall) -> Result<ToolResult> 
         .with_context(|| format!("failed to write `{}`", path.display()))?;
 
     Ok(ToolResult {
-        call_id: call.id.clone(),
+        call_id: call.call_id.clone(),
         name: call.name.clone(),
         ok: true,
         content: format!(
@@ -96,7 +95,7 @@ pub fn edit_file(workspace_root: &Path, call: &ToolCall) -> Result<ToolResult> {
     fs::write(&path, updated).with_context(|| format!("failed to write `{}`", path.display()))?;
 
     Ok(ToolResult {
-        call_id: call.id.clone(),
+        call_id: call.call_id.clone(),
         name: call.name.clone(),
         ok: true,
         content: format!("edited `{}`", path.display()),
@@ -126,7 +125,8 @@ mod tests {
 
     fn edit_call(path: &str, old: &str, new: &str) -> ToolCall {
         ToolCall {
-            id: "call_1".to_string(),
+            call_id: "call_1".to_string(),
+            item_id: None,
             name: "edit".to_string(),
             arguments: json!({
                 "path": path,

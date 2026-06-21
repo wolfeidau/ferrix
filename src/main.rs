@@ -11,7 +11,8 @@ use anyhow::Context;
 use model::OpenAiCompatibleModel;
 use tools::ToolRegistry;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     logging::init();
 
     let workspace_root = std::env::current_dir().context("failed to determine workspace root")?;
@@ -45,7 +46,18 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        match agent.run_turn(input, &mut history) {
+        let mut streamed_answer = false;
+        match agent
+            .run_turn(input, &mut history, |delta| {
+                streamed_answer = true;
+                print!("{delta}");
+                io::stdout()
+                    .flush()
+                    .context("failed to flush streamed response")
+            })
+            .await
+        {
+            Ok(_) if streamed_answer => println!(),
             Ok(answer) if !answer.trim().is_empty() => println!("{answer}"),
             Ok(_) => {}
             Err(error) => eprintln!("error: {error:#}"),
