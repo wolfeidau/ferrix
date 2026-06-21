@@ -57,7 +57,8 @@ pub fn initial_history() -> Vec<ConversationMessage> {
     vec![ConversationMessage::system(
         "You are Ferrix, a small coding agent. \
 Use tools when you need to inspect, modify, or run the project. \
-Prefer exact, minimal edits. The available tools are read, write, edit, and bash. \
+Prefer exact, minimal edits. The available tools are read, write, edit, bash, tool_search, and mcp_call. \
+Use tool_search before mcp_call when you need to discover tools exposed by configured MCP servers. \
 When you are done, respond with a concise final answer.",
     )]
 }
@@ -173,7 +174,8 @@ where
                     response.tool_calls.clone(),
                     response.response_items.clone(),
                 ));
-                self.execute_tool_calls(&recorder, &response.tool_calls, history)?;
+                self.execute_tool_calls(&recorder, &response.tool_calls, history)
+                    .await?;
                 continue;
             }
 
@@ -205,7 +207,7 @@ where
         bail!("agent reached the maximum of {MAX_AGENT_ITERATIONS} iterations");
     }
 
-    fn execute_tool_calls(
+    async fn execute_tool_calls(
         &self,
         recorder: &RunRecorder,
         tool_calls: &[ToolCall],
@@ -213,7 +215,7 @@ where
     ) -> Result<()> {
         for call in tool_calls {
             recorder.record("tool_call", call)?;
-            let result = self.tools.execute(call);
+            let result = self.tools.execute(call).await;
 
             if !result.ok {
                 warn!(tool = %result.name, call_id = %result.call_id, "tool returned an error");
