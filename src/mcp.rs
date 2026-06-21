@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rmcp::model::{CallToolRequestParams, CallToolResult, Content, RawContent, Tool};
@@ -8,11 +9,15 @@ use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
+use tokio::time::timeout;
 use tracing::{debug, info, instrument, warn};
 
 const MCP_CONFIG_PATH: &str = ".ferrix/mcp.json";
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 50;
+const MCP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+const MCP_LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub struct McpRegistry {
@@ -112,12 +117,20 @@ impl McpRegistry {
             .iter()
             .find(|server| server.name == server_name)
             .with_context(|| format!("unknown MCP server `{server_name}`"))?;
-        let result = server
-            .service
-            .peer()
-            .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments))
-            .await
-            .with_context(|| format!("MCP tool `{server_name}/{tool_name}` failed"))?;
+        let result = timeout(
+            MCP_CALL_TIMEOUT,
+            server.service.peer().call_tool(
+                CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments),
+            ),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "MCP tool `{server_name}/{tool_name}` timed out after {} seconds",
+                MCP_CALL_TIMEOUT.as_secs()
+            )
+        })?
+        .with_context(|| format!("MCP tool `{server_name}/{tool_name}` failed"))?;
 
         Ok(normalize_call_result(server_name, tool_name, result))
     }
@@ -309,14 +322,23 @@ async fn connect_server(
     }))
     .with_context(|| format!("failed to spawn MCP server `{server_name}`"))?;
 
-    let service = ()
-        .serve(transport)
+    let service = timeout(MCP_INITIALIZE_TIMEOUT, ().serve(transport))
         .await
+        .with_context(|| {
+            format!(
+                "timed out initializing MCP server `{server_name}` after {} seconds",
+                MCP_INITIALIZE_TIMEOUT.as_secs()
+            )
+        })?
         .with_context(|| format!("failed to initialize MCP server `{server_name}`"))?;
-    let tools = service
-        .peer()
-        .list_all_tools()
+    let tools = timeout(MCP_LIST_TOOLS_TIMEOUT, service.peer().list_all_tools())
         .await
+        .with_context(|| {
+            format!(
+                "timed out listing MCP tools for `{server_name}` after {} seconds",
+                MCP_LIST_TOOLS_TIMEOUT.as_secs()
+            )
+        })?
         .with_context(|| format!("failed to list MCP tools for `{server_name}`"))?
         .into_iter()
         .map(|tool| McpToolEntry {
