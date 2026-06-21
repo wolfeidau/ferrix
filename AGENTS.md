@@ -37,6 +37,7 @@ Ferrix is a small Rust coding-agent CLI. Keep changes focused on the current sha
 
 ## Development Standards
 
+- Ferrix is prerelease experimental software. Prefer correctness and a clean design over preserving compatibility with existing behavior or structure when the two conflict.
 - Prefer small, direct Rust modules over broad abstractions until real duplication appears.
 - Use `anyhow::Context` on fallible IO, HTTP, and serialization paths.
 - Add tests around behavior that can damage files or affect run history, especially filesystem tools and artifact serialization.
