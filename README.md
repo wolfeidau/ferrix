@@ -69,6 +69,20 @@ cargo fmt
 cargo test
 ```
 
+### Dev Container
+
+This repo includes a VS Code/Cursor devcontainer for working inside Docker. Reopen the project in the container, then run:
+
+```sh
+cargo run
+```
+
+The container uses the official Rust devcontainer image, bootstraps `mise`, installs the tools declared in `mise.toml`, fetches Cargo dependencies, and passes through local `FERRIX_*`, `OPENAI_API_KEY`, and Rust logging environment variables. It also binds Docker Desktop's host SSH agent socket at `/agent.sock` so 1Password SSH keys can be used for GitHub clones and SSH commit signing. Check it from inside the container with:
+
+```sh
+ssh-add -l
+```
+
 # License
 
 This application is released under Apache 2.0 license and is copyright [Mark Wolfe](https://www.wolfe.id.au).
