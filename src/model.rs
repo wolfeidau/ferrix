@@ -1,7 +1,17 @@
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
+use async_openai::{
+    Client,
+    config::OpenAIConfig,
+    types::responses::{
+        CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
+        FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem, InputParam, Item,
+        OutputItem, OutputStatus, ResponseStreamEvent, Role, Tool, ToolChoiceOptions,
+        ToolChoiceParam,
+    },
+};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
@@ -80,18 +90,21 @@ pub struct ModelResponse {
 
 pub trait Model {
     fn metadata(&self) -> ModelMetadata;
-    fn complete(
+
+    async fn complete_streaming(
         &self,
         messages: &[ConversationMessage],
         tools: &[ToolDefinition],
+        on_text_delta: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<ModelResponse>;
 }
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleModel {
-    client: Client,
+    client: Client<OpenAIConfig>,
     provider: String,
     model: String,
+    api_base: String,
     endpoint: String,
     api_key: Option<String>,
 }
@@ -101,21 +114,41 @@ impl OpenAiCompatibleModel {
         let provider = std::env::var("FERRIX_MODEL_PROVIDER")
             .unwrap_or_else(|_| "openai-compatible".to_string());
         let model = std::env::var("FERRIX_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_string());
-        let base_url = std::env::var("FERRIX_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let endpoint = chat_completions_endpoint(&base_url);
+        let api_base = normalize_api_base(
+            &std::env::var("FERRIX_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+        );
+        let endpoint = responses_endpoint(&api_base);
         let api_key = std::env::var("FERRIX_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok();
+        let config = OpenAIConfig::new()
+            .with_api_base(api_base.clone())
+            .with_api_key(api_key.clone().unwrap_or_default());
 
         Ok(Self {
-            client: Client::builder()
-                .build()
-                .context("failed to build HTTP client")?,
+            client: Client::with_config(config),
             provider,
             model,
+            api_base,
             endpoint,
             api_key,
+        })
+    }
+
+    fn response_request(
+        &self,
+        messages: &[ConversationMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<CreateResponse> {
+        Ok(CreateResponse {
+            model: Some(self.model.clone()),
+            input: InputParam::Items(response_input_items(messages)?),
+            tools: (!tools.is_empty()).then(|| tools.iter().map(response_tool).collect()),
+            tool_choice: (!tools.is_empty())
+                .then_some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto)),
+            stream: Some(true),
+            ..Default::default()
         })
     }
 }
@@ -129,182 +162,271 @@ impl Model for OpenAiCompatibleModel {
         }
     }
 
-    #[instrument(skip_all, fields(model = %self.model, endpoint = %self.endpoint))]
-    fn complete(
+    #[instrument(skip_all, fields(model = %self.model, api_base = %self.api_base))]
+    async fn complete_streaming(
         &self,
         messages: &[ConversationMessage],
         tools: &[ToolDefinition],
+        on_text_delta: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<ModelResponse> {
-        let api_key = self
-            .api_key
+        self.api_key
             .as_deref()
             .context("set FERRIX_API_KEY or OPENAI_API_KEY to call the model")?;
 
-        let request = json!({
-            "model": self.model,
-            "messages": messages.iter().map(openai_message).collect::<Vec<_>>(),
-            "tools": tools.iter().map(openai_tool).collect::<Vec<_>>(),
-            "tool_choice": "auto"
-        });
+        let request = self.response_request(messages, tools)?;
 
         debug!(
             message_count = messages.len(),
             tool_count = tools.len(),
-            "sending model request"
+            "sending streaming responses request"
         );
 
-        let response: Value = self
+        let mut stream = self
             .client
-            .post(&self.endpoint)
-            .bearer_auth(api_key)
-            .json(&request)
-            .send()
-            .context("model request failed")?
-            .error_for_status()
-            .context("model returned an error status")?
-            .json()
-            .context("failed to parse model response")?;
+            .responses()
+            .create_stream(request)
+            .await
+            .context("model request failed")?;
+        let mut accumulator = StreamAccumulator::default();
 
-        parse_openai_response(response)
+        while let Some(event) = stream.next().await {
+            let event = event.context("failed to read model response stream")?;
+            if let Ok(value) = serde_json::to_value(&event) {
+                collect_execution_plans(&value, &mut accumulator.execution_plans);
+            }
+            accumulator.apply_event(event, on_text_delta)?;
+        }
+
+        accumulator.finish()
     }
 }
 
-fn chat_completions_endpoint(base_url: &str) -> String {
+fn normalize_api_base(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/chat/completions")
+        .or_else(|| trimmed.strip_suffix("/responses"))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn responses_endpoint(base_url: &str) -> String {
     let base_url = base_url.trim_end_matches('/');
-    if base_url.ends_with("/chat/completions") {
+    if base_url.ends_with("/responses") {
         base_url.to_string()
     } else {
-        format!("{base_url}/chat/completions")
+        format!("{base_url}/responses")
     }
 }
 
-fn openai_message(message: &ConversationMessage) -> Value {
-    let mut object = Map::new();
-    object.insert("role".to_string(), json!(message.role));
-
-    if let Some(content) = &message.content {
-        object.insert("content".to_string(), json!(content));
-    } else {
-        object.insert("content".to_string(), Value::Null);
+fn response_input_items(messages: &[ConversationMessage]) -> Result<Vec<InputItem>> {
+    let mut items = Vec::new();
+    for message in messages {
+        items.extend(response_input_items_for_message(message)?);
     }
-
-    if !message.tool_calls.is_empty() {
-        object.insert(
-            "tool_calls".to_string(),
-            Value::Array(message.tool_calls.iter().map(openai_tool_call).collect()),
-        );
-    }
-
-    if let Some(tool_call_id) = &message.tool_call_id {
-        object.insert("tool_call_id".to_string(), json!(tool_call_id));
-    }
-
-    Value::Object(object)
+    Ok(items)
 }
 
-fn openai_tool_call(call: &ToolCall) -> Value {
-    json!({
-        "id": call.id,
-        "type": "function",
-        "function": {
-            "name": call.name,
-            "arguments": call.arguments.to_string()
+fn response_input_items_for_message(message: &ConversationMessage) -> Result<Vec<InputItem>> {
+    match message.role.as_str() {
+        "system" => Ok(vec![easy_message(
+            Role::System,
+            message.content.clone().unwrap_or_default(),
+        )]),
+        "user" => Ok(vec![easy_message(
+            Role::User,
+            message.content.clone().unwrap_or_default(),
+        )]),
+        "assistant" => {
+            let mut items = Vec::new();
+            if let Some(content) = &message.content
+                && !content.is_empty()
+            {
+                items.push(easy_message(Role::Assistant, content.clone()));
+            }
+
+            items.extend(
+                message
+                    .tool_calls
+                    .iter()
+                    .map(response_function_call_item)
+                    .map(InputItem::Item),
+            );
+
+            Ok(items)
         }
+        "tool" => Ok(vec![InputItem::Item(Item::FunctionCallOutput(
+            FunctionCallOutputItemParam {
+                call_id: message
+                    .tool_call_id
+                    .clone()
+                    .context("tool message missing tool_call_id")?,
+                output: FunctionCallOutput::Text(message.content.clone().unwrap_or_default()),
+                id: None,
+                status: Some(OutputStatus::Completed),
+            },
+        ))]),
+        role => bail!("unsupported conversation role `{role}`"),
+    }
+}
+
+fn easy_message(role: Role, content: String) -> InputItem {
+    InputItem::EasyMessage(EasyInputMessage {
+        role,
+        content: EasyInputContent::Text(content),
+        phase: None,
+        ..Default::default()
     })
 }
 
-fn openai_tool(tool: &ToolDefinition) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.parameters
-        }
+fn response_function_call_item(call: &ToolCall) -> Item {
+    Item::FunctionCall(FunctionToolCall {
+        call_id: call.id.clone(),
+        id: Some(call.id.clone()),
+        name: call.name.clone(),
+        namespace: None,
+        arguments: call.arguments.to_string(),
+        status: Some(OutputStatus::Completed),
     })
 }
 
-fn parse_openai_response(response: Value) -> Result<ModelResponse> {
-    let execution_plan = extract_execution_plan(&response);
-    let message = response
-        .pointer("/choices/0/message")
-        .context("model response did not include choices[0].message")?;
+fn response_tool(tool: &ToolDefinition) -> Tool {
+    Tool::Function(FunctionTool {
+        name: tool.name.clone(),
+        description: Some(tool.description.clone()),
+        parameters: Some(tool.parameters.clone()),
+        strict: Some(false),
+        defer_loading: None,
+    })
+}
 
-    let content = message.get("content").and_then(content_to_string);
-    let tool_calls = message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .map(|calls| {
-            calls
-                .iter()
-                .map(parse_tool_call)
-                .collect::<Result<Vec<_>>>()
+#[derive(Default)]
+struct StreamAccumulator {
+    content: String,
+    tool_calls: Vec<PartialToolCall>,
+    execution_plans: Vec<Value>,
+}
+
+impl StreamAccumulator {
+    fn apply_event(
+        &mut self,
+        event: ResponseStreamEvent,
+        on_text_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        match event {
+            ResponseStreamEvent::ResponseOutputTextDelta(event) => {
+                on_text_delta(&event.delta)?;
+                self.content.push_str(&event.delta);
+            }
+            ResponseStreamEvent::ResponseOutputTextDone(event) => {
+                self.content = event.text;
+            }
+            ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(event) => {
+                self.partial_tool_call(event.output_index)
+                    .arguments
+                    .push_str(&event.delta);
+            }
+            ResponseStreamEvent::ResponseFunctionCallArgumentsDone(event) => {
+                let tool_call = self.partial_tool_call(event.output_index);
+                if let Some(name) = event.name {
+                    tool_call.name = name;
+                }
+                tool_call.id.get_or_insert(event.item_id);
+                tool_call.arguments = event.arguments;
+            }
+            ResponseStreamEvent::ResponseOutputItemAdded(event) => {
+                self.apply_output_item(event.output_index, event.item);
+            }
+            ResponseStreamEvent::ResponseOutputItemDone(event) => {
+                self.apply_output_item(event.output_index, event.item);
+            }
+            ResponseStreamEvent::ResponseCompleted(event) => {
+                if let Ok(value) = serde_json::to_value(&event.response) {
+                    collect_execution_plans(&value, &mut self.execution_plans);
+                }
+            }
+            ResponseStreamEvent::ResponseFailed(event) => {
+                bail!("model response failed: {:?}", event.response.error);
+            }
+            ResponseStreamEvent::ResponseIncomplete(event) => {
+                bail!(
+                    "model response incomplete: {:?}",
+                    event.response.incomplete_details
+                );
+            }
+            ResponseStreamEvent::ResponseError(event) => {
+                bail!("model stream error: {}", event.message);
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn apply_output_item(&mut self, output_index: u32, item: OutputItem) {
+        if let OutputItem::FunctionCall(call) = item {
+            let tool_call = self.partial_tool_call(output_index);
+            tool_call.id.get_or_insert(call.call_id);
+            tool_call.name = call.name;
+            tool_call.arguments = call.arguments;
+        }
+    }
+
+    fn partial_tool_call(&mut self, output_index: u32) -> &mut PartialToolCall {
+        let index = output_index as usize;
+        if self.tool_calls.len() <= index {
+            self.tool_calls
+                .resize_with(index + 1, PartialToolCall::default);
+        }
+        &mut self.tool_calls[index]
+    }
+
+    fn finish(self) -> Result<ModelResponse> {
+        let content = (!self.content.is_empty()).then_some(self.content);
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .filter(|call| !call.name.is_empty())
+            .map(PartialToolCall::finish)
+            .collect::<Result<Vec<_>>>()?;
+
+        if content.is_none() && tool_calls.is_empty() {
+            bail!("model response contained neither content nor tool calls");
+        }
+
+        Ok(ModelResponse {
+            content,
+            tool_calls,
+            execution_plan: execution_plan_from_many(self.execution_plans),
         })
-        .transpose()?
-        .unwrap_or_default();
-
-    if content.is_none() && tool_calls.is_empty() {
-        bail!("model response contained neither content nor tool calls");
-    }
-
-    Ok(ModelResponse {
-        content,
-        tool_calls,
-        execution_plan,
-    })
-}
-
-fn content_to_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(content) => Some(content.clone()),
-        Value::Array(parts) => {
-            let text = parts
-                .iter()
-                .filter_map(|part| {
-                    part.get("text")
-                        .and_then(Value::as_str)
-                        .or_else(|| part.get("content").and_then(Value::as_str))
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            (!text.is_empty()).then_some(text)
-        }
-        _ => None,
     }
 }
 
-fn parse_tool_call(value: &Value) -> Result<ToolCall> {
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let function = value
-        .get("function")
-        .context("tool call missing function payload")?;
-    let name = function
-        .get("name")
-        .and_then(Value::as_str)
-        .context("tool call missing function name")?
-        .to_string();
-    let raw_arguments = function
-        .get("arguments")
-        .and_then(Value::as_str)
-        .unwrap_or("{}");
-    let arguments = serde_json::from_str(raw_arguments)
-        .unwrap_or_else(|_| json!({ "raw_arguments": raw_arguments }));
-
-    Ok(ToolCall {
-        id,
-        name,
-        arguments,
-    })
+#[derive(Default)]
+struct PartialToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
 }
 
-fn extract_execution_plan(value: &Value) -> Option<Value> {
-    let mut plans = Vec::new();
-    collect_execution_plans(value, &mut plans);
+impl PartialToolCall {
+    fn finish(self) -> Result<ToolCall> {
+        let arguments = if self.arguments.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&self.arguments)
+                .unwrap_or_else(|_| json!({ "raw_arguments": self.arguments }))
+        };
 
+        Ok(ToolCall {
+            id: self.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            name: self.name,
+            arguments,
+        })
+    }
+}
+
+fn execution_plan_from_many(mut plans: Vec<Value>) -> Option<Value> {
     match plans.len() {
         0 => None,
         1 => plans.pop(),
@@ -342,50 +464,168 @@ fn collect_execution_plans(value: &Value, plans: &mut Vec<Value>) {
 
 #[cfg(test)]
 mod tests {
+    use async_openai::types::responses::{
+        FunctionToolCall, ResponseFunctionCallArgumentsDeltaEvent,
+        ResponseFunctionCallArgumentsDoneEvent, ResponseTextDeltaEvent, ResponseTextDoneEvent,
+    };
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::*;
 
     #[test]
-    fn parses_tool_call_response() {
-        let response = json!({
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "read",
-                            "arguments": "{\"path\":\"src/main.rs\"}"
-                        }
-                    }]
-                }
-            }]
-        });
+    fn builds_response_input_items_for_tool_round() {
+        let messages = vec![
+            ConversationMessage::assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "src/main.rs" }),
+                }],
+            ),
+            ConversationMessage::tool_result("call_1", "{\"ok\":true}"),
+        ];
 
-        let parsed = parse_openai_response(response).expect("parse response");
+        let items = response_input_items(&messages).expect("convert messages");
 
-        assert_eq!(parsed.tool_calls[0].name, "read");
-        assert_eq!(parsed.tool_calls[0].arguments["path"], "src/main.rs");
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], InputItem::Item(Item::FunctionCall(_))));
+        assert!(matches!(
+            items[1],
+            InputItem::Item(Item::FunctionCallOutput(_))
+        ));
+    }
+
+    #[test]
+    fn assembles_streamed_text_response() {
+        let mut streamed = String::new();
+        let mut accumulator = StreamAccumulator::default();
+
+        accumulator
+            .apply_event(text_delta_event("hel"), &mut |delta| {
+                streamed.push_str(delta);
+                Ok(())
+            })
+            .expect("first chunk");
+        accumulator
+            .apply_event(text_delta_event("lo"), &mut |delta| {
+                streamed.push_str(delta);
+                Ok(())
+            })
+            .expect("second chunk");
+        accumulator
+            .apply_event(text_done_event("hello"), &mut |_| Ok(()))
+            .expect("done chunk");
+
+        let response = accumulator.finish().expect("finish response");
+
+        assert_eq!(streamed, "hello");
+        assert_eq!(response.content.as_deref(), Some("hello"));
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn assembles_streamed_tool_call_response() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator
+            .apply_event(
+                ResponseStreamEvent::ResponseOutputItemAdded(
+                    async_openai::types::responses::ResponseOutputItemAddedEvent {
+                        sequence_number: 1,
+                        output_index: 0,
+                        item: OutputItem::FunctionCall(FunctionToolCall {
+                            arguments: String::new(),
+                            call_id: "call_1".to_string(),
+                            namespace: None,
+                            name: "read".to_string(),
+                            id: Some("item_1".to_string()),
+                            status: Some(OutputStatus::InProgress),
+                        }),
+                    },
+                ),
+                &mut |_| Ok(()),
+            )
+            .expect("item added");
+        accumulator
+            .apply_event(function_args_delta("{\"path\""), &mut |_| Ok(()))
+            .expect("argument delta");
+        accumulator
+            .apply_event(
+                function_args_done("{\"path\":\"src/main.rs\"}"),
+                &mut |_| Ok(()),
+            )
+            .expect("arguments done");
+
+        let response = accumulator.finish().expect("finish response");
+
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "read");
+        assert_eq!(response.tool_calls[0].arguments["path"], "src/main.rs");
     }
 
     #[test]
     fn extracts_execution_plan_payloads() {
         let response = json!({
             "execution_plan": { "steps": ["inspect", "edit"] },
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "done"
-                }
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "done"
+                }]
             }]
         });
 
-        let parsed = parse_openai_response(response).expect("parse response");
+        let mut plans = Vec::new();
+        collect_execution_plans(&response, &mut plans);
+        let plan = execution_plan_from_many(plans).expect("extract plan");
 
-        assert_eq!(parsed.execution_plan.unwrap()["steps"][0], "inspect");
+        assert_eq!(plan["steps"][0], "inspect");
+    }
+
+    fn text_delta_event(delta: &str) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
+            sequence_number: 1,
+            item_id: "msg_1".to_string(),
+            output_index: 0,
+            content_index: 0,
+            delta: delta.to_string(),
+            logprobs: None,
+        })
+    }
+
+    fn text_done_event(text: &str) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseOutputTextDone(ResponseTextDoneEvent {
+            sequence_number: 1,
+            item_id: "msg_1".to_string(),
+            output_index: 0,
+            content_index: 0,
+            text: text.to_string(),
+            logprobs: None,
+        })
+    }
+
+    fn function_args_delta(delta: &str) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(
+            ResponseFunctionCallArgumentsDeltaEvent {
+                sequence_number: 1,
+                item_id: "item_1".to_string(),
+                output_index: 0,
+                delta: delta.to_string(),
+            },
+        )
+    }
+
+    fn function_args_done(arguments: &str) -> ResponseStreamEvent {
+        ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+            ResponseFunctionCallArgumentsDoneEvent {
+                name: Some("read".to_string()),
+                sequence_number: 2,
+                item_id: "item_1".to_string(),
+                output_index: 0,
+                arguments: arguments.to_string(),
+            },
+        )
     }
 }

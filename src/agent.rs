@@ -39,10 +39,11 @@ where
     }
 
     #[instrument(skip_all, fields(prompt_len = user_input.len()))]
-    pub fn run_turn(
+    pub async fn run_turn(
         &self,
         user_input: &str,
         history: &mut Vec<ConversationMessage>,
+        mut on_text_delta: impl FnMut(&str) -> Result<()>,
     ) -> Result<String> {
         let recorder = RunRecorder::new(&self.workspace_root)?;
         let metadata = self.model.metadata();
@@ -73,7 +74,8 @@ where
 
             let response = self
                 .model
-                .complete(history, &tool_definitions)
+                .complete_streaming(history, &tool_definitions, &mut on_text_delta)
+                .await
                 .context("model completion failed")?;
 
             if let Some(plan) = &response.execution_plan {
