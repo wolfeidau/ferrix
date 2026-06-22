@@ -32,7 +32,8 @@ Ferrix is a small Rust coding-agent CLI. Keep changes focused on the current sha
 ## Model Configuration
 
 - The default backend is the OpenAI-compatible HTTP Responses API.
-- Configuration comes from `FERRIX_MODEL_PROVIDER`, `FERRIX_MODEL`, `FERRIX_BASE_URL`, and `FERRIX_API_KEY`; `OPENAI_API_KEY` is accepted as a fallback.
+- Non-secret model configuration comes from `.ferrix/config.json`, with environment variables such as `FERRIX_MODEL_PROVIDER`, `FERRIX_MODEL`, `FERRIX_BASE_URL`, `FERRIX_REASONING_EFFORT`, `FERRIX_MAX_OUTPUT_TOKENS`, `FERRIX_TEMPERATURE`, and `FERRIX_TOP_P` available as overrides.
+- Use provider-native API key variables: `OPENROUTER_API_KEY` for OpenRouter and `OPENAI_API_KEY` for OpenAI-compatible requests.
 - Do not hard-code secrets, model keys, or user-specific endpoints.
 
 ## Development Standards

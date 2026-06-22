@@ -8,22 +8,63 @@ ferrix> _
 
 ## Setup
 
-Ferrix is configured with environment variables:
+Ferrix reads non-secret model settings from `.ferrix/config.json` in the workspace:
 
-```sh
-export FERRIX_API_KEY="..."
-export FERRIX_MODEL="gpt-5.5"
-export FERRIX_REASONING_EFFORT="low"
-export FERRIX_BASE_URL="https://api.openai.com/v1"
+```json
+{
+  "model": {
+    "provider": "openrouter",
+    "name": "openai/gpt-5.2",
+    "reasoning_effort": "low",
+    "max_output_tokens": 9000,
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "openrouter": {
+      "referer": "https://example.com",
+      "title": "Ferrix",
+      "categories": "cli-agent"
+    }
+  }
+}
 ```
 
-| Variable | Required | Description |
-| --- | --- | --- |
-| `FERRIX_API_KEY` | Yes | API key used for model requests. `OPENAI_API_KEY` is accepted as a fallback. |
-| `FERRIX_MODEL` | No | Model name. Defaults to `gpt-5.5`. |
-| `FERRIX_REASONING_EFFORT` | No | Optional reasoning effort for models that support it. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`. If unset, Ferrix uses the model default. |
-| `FERRIX_BASE_URL` | No | Responses API base URL. Defaults to `https://api.openai.com/v1`. Ferrix appends `/responses`; a full `/responses` endpoint is also accepted. |
-| `FERRIX_MODEL_PROVIDER` | No | Provider label recorded in run metadata. Defaults to `openai-compatible`. |
+API keys stay in environment variables. Use the key for the provider selected by the workspace config:
+
+```sh
+export OPENROUTER_API_KEY="..."
+# or
+export OPENAI_API_KEY="..."
+```
+
+If `.ferrix/config.json` is missing, Ferrix defaults to the OpenAI-compatible Responses API with model `gpt-5.5` and base URL `https://api.openai.com/v1`. When present, the file is validated with JSON Schema before Ferrix starts.
+
+| Config key | Description |
+| --- | --- |
+| `model.provider` | Provider label. Use `openrouter` for OpenRouter. Defaults to `openai-compatible`. |
+| `model.name` | Model name. Defaults to `gpt-5.5`. |
+| `model.base_url` | Responses API base URL. Ferrix appends `/responses`; a full `/responses` endpoint is also accepted. OpenRouter defaults to `https://openrouter.ai/api/v1`. |
+| `model.reasoning_effort` | Optional reasoning effort. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`. |
+| `model.max_output_tokens` | Optional maximum output token count. |
+| `model.temperature` | Optional sampling temperature from `0` to `2`. |
+| `model.top_p` | Optional nucleus sampling value from `0` to `1`. |
+| `model.openrouter.referer` | Optional OpenRouter `HTTP-Referer` attribution header. |
+| `model.openrouter.title` | Optional OpenRouter `X-OpenRouter-Title` attribution header. |
+| `model.openrouter.categories` | Optional OpenRouter `X-OpenRouter-Categories` attribution header. |
+
+| Environment variable | Description |
+| --- | --- |
+| `OPENROUTER_API_KEY` | API key used when `model.provider` is `openrouter`. |
+| `OPENAI_API_KEY` | API key used for OpenAI-compatible requests that are not OpenRouter. |
+| `FERRIX_MODEL_PROVIDER` | Overrides `model.provider`. |
+| `FERRIX_MODEL` | Overrides `model.name`. |
+| `FERRIX_BASE_URL` | Overrides `model.base_url`. |
+| `FERRIX_REASONING_EFFORT` | Overrides `model.reasoning_effort`. |
+| `FERRIX_MAX_OUTPUT_TOKENS` | Overrides `model.max_output_tokens`. |
+| `FERRIX_TEMPERATURE` | Overrides `model.temperature`. |
+| `FERRIX_TOP_P` | Overrides `model.top_p`. |
+| `FERRIX_OPENROUTER_REFERER` | Overrides `model.openrouter.referer`. |
+| `FERRIX_OPENROUTER_TITLE` | Overrides `model.openrouter.title`. |
+| `FERRIX_OPENROUTER_CATEGORIES` | Overrides `model.openrouter.categories`. |
 
 ## Usage
 
@@ -114,7 +155,7 @@ This repo includes a VS Code/Cursor devcontainer for working inside Docker. Reop
 cargo run
 ```
 
-The container uses the official Rust devcontainer image, bootstraps `mise`, installs the tools declared in `mise.toml`, fetches Cargo dependencies, and passes through local `FERRIX_*`, `OPENAI_API_KEY`, and Rust logging environment variables. It also binds Docker Desktop's host SSH agent socket at `/agent.sock` so 1Password SSH keys can be used for GitHub clones and SSH commit signing. Check it from inside the container with:
+The container uses the official Rust devcontainer image, bootstraps `mise`, installs the tools declared in `mise.toml`, fetches Cargo dependencies, and passes through local `FERRIX_*`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, and Rust logging environment variables. It also binds Docker Desktop's host SSH agent socket at `/agent.sock` so 1Password SSH keys can be used for GitHub clones and SSH commit signing. Check it from inside the container with:
 
 ```sh
 ssh-add -l
