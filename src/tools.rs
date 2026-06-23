@@ -89,8 +89,8 @@ impl ToolRegistry {
                             "description": "Complete file contents."
                         },
                         "create_dirs": {
-                            "type": ["boolean", "null"],
-                            "description": "Create missing parent directories before writing. Use null or false when parent directories must already exist."
+                            "type": "boolean",
+                            "description": "Create missing parent directories before writing. Use false when parent directories must already exist."
                         }
                     },
                     "required": ["path", "contents", "create_dirs"],
@@ -146,8 +146,8 @@ impl ToolRegistry {
                             "description": "Words to match against MCP server names, tool names, titles, and descriptions. Use an empty string to list the first tools."
                         },
                         "limit": {
-                            "type": ["integer", "null"],
-                            "description": "Maximum number of matches to return. Use null for the default."
+                            "type": "integer",
+                            "description": "Maximum number of matches to return. Use 10 for the default."
                         }
                     },
                     "required": ["query", "limit"],
@@ -313,6 +313,7 @@ mod tests {
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>();
 
+            assert_no_union_types(&tool.name, &tool.parameters);
             assert_eq!(
                 required, property_names,
                 "{} must require every declared property for strict mode",
@@ -361,6 +362,27 @@ mod tests {
                 Value::Object(_) => assert_strict_objects(tool_name, value),
                 _ => {}
             }
+        }
+    }
+
+    fn assert_no_union_types(tool_name: &str, schema: &Value) {
+        match schema {
+            Value::Object(object) => {
+                assert!(
+                    !matches!(object.get("type"), Some(Value::Array(_))),
+                    "{tool_name} schemas should avoid union `type` arrays for provider compatibility"
+                );
+
+                for value in object.values() {
+                    assert_no_union_types(tool_name, value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    assert_no_union_types(tool_name, value);
+                }
+            }
+            _ => {}
         }
     }
 }

@@ -277,7 +277,15 @@ fn response_input_items_for_message(message: &ConversationMessage) -> Result<Vec
                 items.push(easy_message(Role::Assistant, content.clone()));
             }
 
-            if !message.response_items.is_empty() {
+            if !message.tool_calls.is_empty() {
+                items.extend(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(response_function_call_item)
+                        .map(InputItem::Item),
+                );
+            } else if !message.response_items.is_empty() {
                 items.extend(
                     message
                         .response_items
@@ -287,14 +295,6 @@ fn response_input_items_for_message(message: &ConversationMessage) -> Result<Vec
                         .collect::<Result<Vec<_>, _>>()
                         .context("failed to parse stored response item")?
                         .into_iter()
-                        .map(InputItem::Item),
-                );
-            } else {
-                items.extend(
-                    message
-                        .tool_calls
-                        .iter()
-                        .map(response_function_call_item)
                         .map(InputItem::Item),
                 );
             }
@@ -781,6 +781,41 @@ mod tests {
 
         assert_eq!(items.len(), 2);
         assert!(matches!(items[0], InputItem::Item(Item::FunctionCall(_))));
+        assert!(matches!(
+            items[1],
+            InputItem::Item(Item::FunctionCallOutput(_))
+        ));
+    }
+
+    #[test]
+    fn replays_tool_calls_with_item_ids_before_tool_results() {
+        let messages = vec![
+            ConversationMessage::assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    call_id: "call_1".to_string(),
+                    item_id: Some("fc_1".to_string()),
+                    name: "tool_search".to_string(),
+                    arguments: json!({ "query": "buildkite", "limit": 10 }),
+                }],
+                vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "tool_search",
+                    "arguments": "{\"query\":\"buildkite\",\"limit\":10}"
+                })],
+            ),
+            ConversationMessage::tool_result("call_1", "{\"ok\":true}"),
+        ];
+
+        let items = response_input_items(&messages).expect("convert messages");
+
+        assert_eq!(items.len(), 2);
+        let InputItem::Item(Item::FunctionCall(call)) = &items[0] else {
+            panic!("first item should be a function call");
+        };
+        assert_eq!(call.id.as_deref(), Some("fc_1"));
+        assert_eq!(call.call_id, "call_1");
         assert!(matches!(
             items[1],
             InputItem::Item(Item::FunctionCallOutput(_))
