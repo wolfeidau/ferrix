@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{Context, Result, bail};
 use async_openai::{
     Client,
@@ -15,6 +17,7 @@ use serde_json::{Value, json};
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
+use crate::config::ModelConfig;
 use crate::tools::{ToolCall, ToolDefinition};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,34 +123,34 @@ pub struct OpenAiCompatibleModel {
     api_base: String,
     endpoint: String,
     api_key: Option<String>,
+    api_key_env_var: &'static str,
     reasoning_effort: Option<ReasoningEffort>,
+    max_output_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
 }
 
 impl OpenAiCompatibleModel {
-    pub fn from_env() -> Result<Self> {
-        let provider = env_or_default("FERRIX_MODEL_PROVIDER", "openai-compatible");
-        let model = env_or_default("FERRIX_MODEL", "gpt-5.5");
-        let api_base = normalize_api_base(&env_or_default(
-            "FERRIX_BASE_URL",
-            "https://api.openai.com/v1",
-        ))?;
-        let endpoint = responses_endpoint(&api_base);
-        let api_key = env_optional("FERRIX_API_KEY").or_else(|| env_optional("OPENAI_API_KEY"));
-        let config = OpenAIConfig::new()
-            .with_api_base(api_base.clone())
-            .with_api_key(api_key.clone().unwrap_or_default());
-        let reasoning_effort = env_optional("FERRIX_REASONING_EFFORT")
-            .map(|effort| parse_reasoning_effort(&effort))
-            .transpose()?;
+    pub fn from_workspace(workspace_root: &Path) -> Result<Self> {
+        let model_config = ModelConfig::from_workspace(workspace_root)?;
+        Self::from_config(model_config)
+    }
+
+    fn from_config(model_config: ModelConfig) -> Result<Self> {
+        let config = openai_config(&model_config)?;
 
         Ok(Self {
             client: Client::with_config(config),
-            provider,
-            model,
-            api_base,
-            endpoint,
-            api_key,
-            reasoning_effort,
+            provider: model_config.provider,
+            model: model_config.model,
+            api_base: model_config.api_base,
+            endpoint: model_config.endpoint,
+            api_key: model_config.api_key,
+            api_key_env_var: model_config.api_key_env_var,
+            reasoning_effort: model_config.reasoning_effort,
+            max_output_tokens: model_config.max_output_tokens,
+            temperature: model_config.temperature,
+            top_p: model_config.top_p,
         })
     }
 
@@ -164,6 +167,9 @@ impl OpenAiCompatibleModel {
                 .then_some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto)),
             stream: Some(true),
             store: Some(false),
+            max_output_tokens: self.max_output_tokens,
+            temperature: self.temperature,
+            top_p: self.top_p,
             reasoning: self.reasoning_effort.clone().map(|effort| Reasoning {
                 effort: Some(effort),
                 ..Default::default()
@@ -191,7 +197,7 @@ impl Model for OpenAiCompatibleModel {
     ) -> Result<ModelResponse> {
         self.api_key
             .as_deref()
-            .context("set FERRIX_API_KEY or OPENAI_API_KEY to call the model")?;
+            .with_context(|| format!("set {} to call the model", self.api_key_env_var))?;
 
         let request = self.response_request(messages, tools)?;
 
@@ -221,55 +227,28 @@ impl Model for OpenAiCompatibleModel {
     }
 }
 
-fn env_or_default(name: &str, default: &str) -> String {
-    env_optional(name).unwrap_or_else(|| default.to_string())
-}
+fn openai_config(config: &ModelConfig) -> Result<OpenAIConfig> {
+    let mut openai_config = OpenAIConfig::new()
+        .with_api_base(config.api_base.clone())
+        .with_api_key(config.api_key.clone().unwrap_or_default());
 
-fn env_optional(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn normalize_api_base(base_url: &str) -> Result<String> {
-    let trimmed = base_url.trim_end_matches('/');
-    if trimmed.is_empty() {
-        bail!("FERRIX_BASE_URL must not be empty");
+    if let Some(referer) = &config.openrouter.referer {
+        openai_config = openai_config
+            .with_header("HTTP-Referer", referer)
+            .context("invalid OpenRouter referer header")?;
     }
-    if trimmed.ends_with("/chat/completions") {
-        bail!(
-            "FERRIX_BASE_URL must point to a Responses API base URL, not a chat completions endpoint"
-        );
+    if let Some(title) = &config.openrouter.title {
+        openai_config = openai_config
+            .with_header("X-OpenRouter-Title", title)
+            .context("invalid OpenRouter title header")?;
+    }
+    if let Some(categories) = &config.openrouter.categories {
+        openai_config = openai_config
+            .with_header("X-OpenRouter-Categories", categories)
+            .context("invalid OpenRouter categories header")?;
     }
 
-    Ok(trimmed
-        .strip_suffix("/responses")
-        .unwrap_or(trimmed)
-        .to_string())
-}
-
-fn responses_endpoint(base_url: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
-    if base_url.ends_with("/responses") {
-        base_url.to_string()
-    } else {
-        format!("{base_url}/responses")
-    }
-}
-
-fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "none" => Ok(ReasoningEffort::None),
-        "minimal" => Ok(ReasoningEffort::Minimal),
-        "low" => Ok(ReasoningEffort::Low),
-        "medium" => Ok(ReasoningEffort::Medium),
-        "high" => Ok(ReasoningEffort::High),
-        "xhigh" => Ok(ReasoningEffort::Xhigh),
-        other => bail!(
-            "invalid FERRIX_REASONING_EFFORT `{other}`; expected one of none, minimal, low, medium, high, xhigh"
-        ),
-    }
+    Ok(openai_config)
 }
 
 fn response_input_items(messages: &[ConversationMessage]) -> Result<Vec<InputItem>> {
@@ -298,7 +277,15 @@ fn response_input_items_for_message(message: &ConversationMessage) -> Result<Vec
                 items.push(easy_message(Role::Assistant, content.clone()));
             }
 
-            if !message.response_items.is_empty() {
+            if !message.tool_calls.is_empty() {
+                items.extend(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(response_function_call_item)
+                        .map(InputItem::Item),
+                );
+            } else if !message.response_items.is_empty() {
                 items.extend(
                     message
                         .response_items
@@ -308,14 +295,6 @@ fn response_input_items_for_message(message: &ConversationMessage) -> Result<Vec
                         .collect::<Result<Vec<_>, _>>()
                         .context("failed to parse stored response item")?
                         .into_iter()
-                        .map(InputItem::Item),
-                );
-            } else {
-                items.extend(
-                    message
-                        .tool_calls
-                        .iter()
-                        .map(response_function_call_item)
                         .map(InputItem::Item),
                 );
             }
@@ -567,6 +546,7 @@ fn response_item_for_input(mut item: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use async_openai::config::Config as _;
     use async_openai::types::responses::{
         FunctionToolCall, ResponseFunctionCallArgumentsDeltaEvent,
         ResponseFunctionCallArgumentsDoneEvent, ResponseTextDeltaEvent, ResponseTextDoneEvent,
@@ -574,48 +554,91 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
+    use crate::config::OpenRouterConfig;
+
     use super::*;
 
     #[test]
-    fn normalizes_responses_api_base_url() {
-        let base = normalize_api_base("https://api.openai.com/v1").expect("normalize base");
+    fn response_request_sets_configured_request_options() {
+        let model = test_model();
+        let model = OpenAiCompatibleModel {
+            max_output_tokens: Some(4096),
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            ..model
+        };
 
-        assert_eq!(base, "https://api.openai.com/v1");
+        let request = model
+            .response_request(&[ConversationMessage::user("hello")], &[])
+            .expect("build request");
+
+        assert_eq!(request.max_output_tokens, Some(4096));
+        assert_eq!(request.temperature, Some(0.2));
+        assert_eq!(request.top_p, Some(0.9));
+    }
+
+    #[tokio::test]
+    async fn missing_provider_api_key_reports_expected_env_var() {
+        let model = OpenAiCompatibleModel {
+            api_key: None,
+            api_key_env_var: "OPENROUTER_API_KEY",
+            ..test_model()
+        };
+
+        let error = model
+            .complete_streaming(&[ConversationMessage::user("hello")], &[], &mut |_| Ok(()))
+            .await
+            .expect_err("missing key should fail");
+
+        assert!(error.to_string().contains("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn openrouter_headers_are_added_when_configured() {
+        let config = ModelConfig {
+            provider: "openrouter".to_string(),
+            model: "openai/gpt-5.2".to_string(),
+            api_base: "https://openrouter.ai/api/v1".to_string(),
+            endpoint: "https://openrouter.ai/api/v1/responses".to_string(),
+            api_key: Some("sk-or".to_string()),
+            api_key_env_var: "OPENROUTER_API_KEY",
+            reasoning_effort: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            openrouter: OpenRouterConfig {
+                referer: Some("https://example.com".to_string()),
+                title: Some("Ferrix".to_string()),
+                categories: Some("cli-agent".to_string()),
+            },
+        };
+
+        let headers = openai_config(&config).expect("build config").headers();
+
         assert_eq!(
-            responses_endpoint(&base),
-            "https://api.openai.com/v1/responses"
+            headers
+                .get("HTTP-Referer")
+                .expect("referer header")
+                .to_str()
+                .unwrap(),
+            "https://example.com"
         );
-    }
-
-    #[test]
-    fn normalizes_responses_endpoint_url() {
-        let base =
-            normalize_api_base("https://api.openai.com/v1/responses").expect("normalize endpoint");
-
-        assert_eq!(base, "https://api.openai.com/v1");
         assert_eq!(
-            responses_endpoint(&base),
-            "https://api.openai.com/v1/responses"
+            headers
+                .get("X-OpenRouter-Title")
+                .expect("title header")
+                .to_str()
+                .unwrap(),
+            "Ferrix"
         );
-    }
-
-    #[test]
-    fn rejects_chat_completions_endpoint_url() {
-        let error = normalize_api_base("https://api.openai.com/v1/chat/completions")
-            .expect_err("chat completions endpoint should be rejected");
-
-        assert!(
-            error
-                .to_string()
-                .contains("Responses API base URL, not a chat completions endpoint")
+        assert_eq!(
+            headers
+                .get("X-OpenRouter-Categories")
+                .expect("categories header")
+                .to_str()
+                .unwrap(),
+            "cli-agent"
         );
-    }
-
-    #[test]
-    fn rejects_empty_responses_api_base_url() {
-        let error = normalize_api_base("").expect_err("empty endpoint should be rejected");
-
-        assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]
@@ -627,7 +650,11 @@ mod tests {
             api_base: "https://api.openai.com/v1".to_string(),
             endpoint: "https://api.openai.com/v1/responses".to_string(),
             api_key: Some("test".to_string()),
+            api_key_env_var: "OPENAI_API_KEY",
             reasoning_effort: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
         };
 
         let request = model
@@ -639,43 +666,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_reasoning_effort_values() {
-        assert_eq!(
-            parse_reasoning_effort("none").unwrap(),
-            ReasoningEffort::None
-        );
-        assert_eq!(
-            parse_reasoning_effort("minimal").unwrap(),
-            ReasoningEffort::Minimal
-        );
-        assert_eq!(parse_reasoning_effort("low").unwrap(), ReasoningEffort::Low);
-        assert_eq!(
-            parse_reasoning_effort("medium").unwrap(),
-            ReasoningEffort::Medium
-        );
-        assert_eq!(
-            parse_reasoning_effort("HIGH").unwrap(),
-            ReasoningEffort::High
-        );
-        assert_eq!(
-            parse_reasoning_effort("xhigh").unwrap(),
-            ReasoningEffort::Xhigh
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_reasoning_effort_value() {
-        let error =
-            parse_reasoning_effort("maximum").expect_err("invalid reasoning effort should fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("invalid FERRIX_REASONING_EFFORT")
-        );
-    }
-
-    #[test]
     fn response_request_sets_configured_reasoning_effort() {
         let model = OpenAiCompatibleModel {
             client: Client::with_config(OpenAIConfig::new().with_api_key("test")),
@@ -684,7 +674,11 @@ mod tests {
             api_base: "https://api.openai.com/v1".to_string(),
             endpoint: "https://api.openai.com/v1/responses".to_string(),
             api_key: Some("test".to_string()),
+            api_key_env_var: "OPENAI_API_KEY",
             reasoning_effort: Some(ReasoningEffort::Low),
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
         };
 
         let request = model
@@ -706,7 +700,11 @@ mod tests {
             api_base: "https://api.openai.com/v1".to_string(),
             endpoint: "https://api.openai.com/v1/responses".to_string(),
             api_key: Some("test".to_string()),
+            api_key_env_var: "OPENAI_API_KEY",
             reasoning_effort: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
         };
         let tools = vec![ToolDefinition {
             name: "read".to_string(),
@@ -783,6 +781,41 @@ mod tests {
 
         assert_eq!(items.len(), 2);
         assert!(matches!(items[0], InputItem::Item(Item::FunctionCall(_))));
+        assert!(matches!(
+            items[1],
+            InputItem::Item(Item::FunctionCallOutput(_))
+        ));
+    }
+
+    #[test]
+    fn replays_tool_calls_with_item_ids_before_tool_results() {
+        let messages = vec![
+            ConversationMessage::assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    call_id: "call_1".to_string(),
+                    item_id: Some("fc_1".to_string()),
+                    name: "tool_search".to_string(),
+                    arguments: json!({ "query": "buildkite", "limit": 10 }),
+                }],
+                vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "tool_search",
+                    "arguments": "{\"query\":\"buildkite\",\"limit\":10}"
+                })],
+            ),
+            ConversationMessage::tool_result("call_1", "{\"ok\":true}"),
+        ];
+
+        let items = response_input_items(&messages).expect("convert messages");
+
+        assert_eq!(items.len(), 2);
+        let InputItem::Item(Item::FunctionCall(call)) = &items[0] else {
+            panic!("first item should be a function call");
+        };
+        assert_eq!(call.id.as_deref(), Some("fc_1"));
+        assert_eq!(call.call_id, "call_1");
         assert!(matches!(
             items[1],
             InputItem::Item(Item::FunctionCallOutput(_))
@@ -924,5 +957,21 @@ mod tests {
                 arguments: arguments.to_string(),
             },
         )
+    }
+
+    fn test_model() -> OpenAiCompatibleModel {
+        OpenAiCompatibleModel {
+            client: Client::with_config(OpenAIConfig::new().with_api_key("test")),
+            provider: "test".to_string(),
+            model: "gpt-test".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            endpoint: "https://api.openai.com/v1/responses".to_string(),
+            api_key: Some("test".to_string()),
+            api_key_env_var: "OPENAI_API_KEY",
+            reasoning_effort: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+        }
     }
 }
