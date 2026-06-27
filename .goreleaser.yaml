@@ -20,6 +20,10 @@ builds:
   - builder: rust
     flags:
       - --release
+    env:
+      - RUSTFLAGS=-C strip=symbols
+      - APP_VERSION={{.Version}}
+      - BUILD_DATE={{.Date}}
     targets:
       - x86_64-unknown-linux-gnu
       - x86_64-apple-darwin

@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
 
     let startup_mode = parse_startup_mode(std::env::args().skip(1))?;
     if startup_mode == StartupMode::Version {
-        println!("ferrix {}", env!("CARGO_PKG_VERSION"));
+        println!("ferrix {}", app_version());
         return Ok(());
     }
 
@@ -107,6 +107,10 @@ fn parse_startup_mode(args: impl IntoIterator<Item = String>) -> anyhow::Result<
         }
         _ => bail!("unknown argument: {first}"),
     }
+}
+
+fn app_version() -> &'static str {
+    option_env!("APP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 async fn run_repl(
