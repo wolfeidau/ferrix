@@ -18,8 +18,7 @@ steps:
           CARGO_HOME: "~/rustcache"
           CARGO_TARGET_DIR: "~/rustmodcache"
         commands:
-          - "cargo fmt --check"
-          - cargo clippy --all-targets --all-features --locked --message-format=json -- -D warnings | clippy-sarif | tee clippy.sarif | sarif-fmt
+          - "mise run lint"
         artifact_paths:
           - "clippy.sarif"
         plugins:

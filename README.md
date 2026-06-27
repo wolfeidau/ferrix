@@ -50,6 +50,9 @@ If `.ferrix/config.json` is missing, Ferrix defaults to the OpenAI-compatible Re
 | `model.openrouter.referer` | Optional OpenRouter `HTTP-Referer` attribution header. |
 | `model.openrouter.title` | Optional OpenRouter `X-OpenRouter-Title` attribution header. |
 | `model.openrouter.categories` | Optional OpenRouter `X-OpenRouter-Categories` attribution header. |
+| `model.prompt_cache.retention` | Optional prompt cache retention. Accepted values are `in_memory` and `24h`. |
+| `model.prompt_cache.key` | Optional stable prompt cache key. When omitted, Ferrix generates one per process. |
+| `model.prompt_cache.store_responses` | When `true`, stores responses on the provider and chains agent iterations with `previous_response_id`. Defaults to `false`. |
 
 | Environment variable | Description |
 | --- | --- |
@@ -65,6 +68,9 @@ If `.ferrix/config.json` is missing, Ferrix defaults to the OpenAI-compatible Re
 | `FERRIX_OPENROUTER_REFERER` | Overrides `model.openrouter.referer`. |
 | `FERRIX_OPENROUTER_TITLE` | Overrides `model.openrouter.title`. |
 | `FERRIX_OPENROUTER_CATEGORIES` | Overrides `model.openrouter.categories`. |
+| `FERRIX_PROMPT_CACHE_RETENTION` | Overrides `model.prompt_cache.retention`. |
+| `FERRIX_PROMPT_CACHE_KEY` | Overrides `model.prompt_cache.key`. |
+| `FERRIX_STORE_RESPONSES` | Overrides `model.prompt_cache.store_responses`. |
 
 ## Usage
 

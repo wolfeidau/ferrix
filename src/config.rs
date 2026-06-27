@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use async_openai::types::responses::ReasoningEffort;
+use async_openai::types::responses::{PromptCacheRetention, ReasoningEffort};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,6 +26,14 @@ pub struct ModelConfig {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub openrouter: OpenRouterConfig,
+    pub prompt_cache: PromptCacheConfig,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PromptCacheConfig {
+    pub retention: Option<PromptCacheRetention>,
+    pub key: Option<String>,
+    pub store_responses: bool,
 }
 
 impl ModelConfig {
@@ -88,6 +96,18 @@ impl ModelConfig {
             None => workspace_model.reasoning_effort.map(Into::into),
         };
 
+        let prompt_cache = workspace_model.prompt_cache.unwrap_or_default();
+        let prompt_cache_retention = match env("FERRIX_PROMPT_CACHE_RETENTION") {
+            Some(value) => Some(parse_prompt_cache_retention(&value)?),
+            None => prompt_cache.retention.map(Into::into),
+        };
+        let prompt_cache_key = env("FERRIX_PROMPT_CACHE_KEY").or(prompt_cache.key);
+        let store_responses = parse_bool_option(
+            "FERRIX_STORE_RESPONSES",
+            env("FERRIX_STORE_RESPONSES"),
+            prompt_cache.store_responses,
+        )?;
+
         Ok(Self {
             provider,
             model,
@@ -116,7 +136,19 @@ impl ModelConfig {
                 1.0,
             )?,
             openrouter,
+            prompt_cache: PromptCacheConfig {
+                retention: prompt_cache_retention,
+                key: prompt_cache_key,
+                store_responses,
+            },
         })
+    }
+
+    pub fn with_prompt_cache_key(mut self, key: Option<String>) -> Self {
+        if self.prompt_cache.key.is_none() {
+            self.prompt_cache.key = key;
+        }
+        self
     }
 }
 
@@ -185,6 +217,39 @@ struct WorkspaceModelConfig {
     top_p: Option<f32>,
     #[serde(default)]
     openrouter: Option<OpenRouterConfig>,
+    #[serde(default)]
+    prompt_cache: Option<WorkspacePromptCacheConfig>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkspacePromptCacheConfig {
+    #[serde(default)]
+    retention: Option<WorkspacePromptCacheRetention>,
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    key: Option<String>,
+    #[serde(default)]
+    store_responses: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(rename_all = "lowercase")]
+enum WorkspacePromptCacheRetention {
+    #[serde(rename = "in_memory")]
+    InMemory,
+    #[serde(rename = "24h")]
+    Hours24,
+}
+
+impl From<WorkspacePromptCacheRetention> for PromptCacheRetention {
+    fn from(retention: WorkspacePromptCacheRetention) -> Self {
+        match retention {
+            WorkspacePromptCacheRetention::InMemory => Self::InMemory,
+            WorkspacePromptCacheRetention::Hours24 => Self::Hours24,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -319,6 +384,35 @@ fn responses_endpoint(base_url: &str) -> String {
         base_url.to_string()
     } else {
         format!("{base_url}/responses")
+    }
+}
+
+fn parse_bool_option(
+    name: &str,
+    env_value: Option<String>,
+    config_value: Option<bool>,
+) -> Result<bool> {
+    match env_value {
+        Some(value) => parse_bool(&value).with_context(|| format!("invalid {name} `{value}`")),
+        None => Ok(config_value.unwrap_or(false)),
+    }
+}
+
+fn parse_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => bail!("invalid boolean `{other}`; expected true or false"),
+    }
+}
+
+fn parse_prompt_cache_retention(value: &str) -> Result<PromptCacheRetention> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "in_memory" => Ok(PromptCacheRetention::InMemory),
+        "24h" => Ok(PromptCacheRetention::Hours24),
+        other => {
+            bail!("invalid FERRIX_PROMPT_CACHE_RETENTION `{other}`; expected in_memory or 24h")
+        }
     }
 }
 
@@ -678,6 +772,102 @@ mod tests {
         )
         .expect_err("invalid top_p should fail");
         assert!(error.to_string().contains("FERRIX_TOP_P"));
+    }
+
+    #[test]
+    fn loads_prompt_cache_config_from_ferrix_config_json() {
+        let workspace = temp_workspace();
+        write_config(
+            &workspace,
+            r#"{
+                "model": {
+                    "prompt_cache": {
+                        "retention": "24h",
+                        "key": "my-session",
+                        "store_responses": true
+                    }
+                }
+            }"#,
+        );
+
+        let config =
+            ModelConfig::from_workspace_with_env(&workspace, env_from(&[])).expect("load config");
+
+        assert_eq!(
+            config.prompt_cache.retention,
+            Some(PromptCacheRetention::Hours24)
+        );
+        assert_eq!(config.prompt_cache.key.as_deref(), Some("my-session"));
+        assert!(config.prompt_cache.store_responses);
+    }
+
+    #[test]
+    fn env_overrides_prompt_cache_config() {
+        let workspace = temp_workspace();
+        write_config(
+            &workspace,
+            r#"{
+                "model": {
+                    "prompt_cache": {
+                        "retention": "24h",
+                        "key": "config-key",
+                        "store_responses": false
+                    }
+                }
+            }"#,
+        );
+
+        let config = ModelConfig::from_workspace_with_env(
+            &workspace,
+            env_from(&[
+                ("FERRIX_PROMPT_CACHE_RETENTION", "in_memory"),
+                ("FERRIX_PROMPT_CACHE_KEY", "env-key"),
+                ("FERRIX_STORE_RESPONSES", "true"),
+            ]),
+        )
+        .expect("load config");
+
+        assert_eq!(
+            config.prompt_cache.retention,
+            Some(PromptCacheRetention::InMemory)
+        );
+        assert_eq!(config.prompt_cache.key.as_deref(), Some("env-key"));
+        assert!(config.prompt_cache.store_responses);
+    }
+
+    #[test]
+    fn with_prompt_cache_key_fills_missing_key_only() {
+        let config = ModelConfig::from_parts(None, env_from(&[]))
+            .expect("resolve config")
+            .with_prompt_cache_key(Some("session-key".to_string()));
+
+        assert_eq!(config.prompt_cache.key.as_deref(), Some("session-key"));
+
+        let config = ModelConfig::from_parts(
+            Some(WorkspaceModelConfig {
+                prompt_cache: Some(WorkspacePromptCacheConfig {
+                    key: Some("configured".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            env_from(&[]),
+        )
+        .expect("resolve config")
+        .with_prompt_cache_key(Some("session-key".to_string()));
+
+        assert_eq!(config.prompt_cache.key.as_deref(), Some("configured"));
+    }
+
+    #[test]
+    fn rejects_invalid_prompt_cache_retention() {
+        let error = parse_prompt_cache_retention("forever").expect_err("invalid retention");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid FERRIX_PROMPT_CACHE_RETENTION")
+        );
     }
 
     fn env_from(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'static {

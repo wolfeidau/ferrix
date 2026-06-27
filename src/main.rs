@@ -13,17 +13,21 @@ use anyhow::Context;
 use mcp::McpRegistry;
 use model::OpenAiCompatibleModel;
 use tools::ToolRegistry;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     logging::init();
 
     let workspace_root = std::env::current_dir().context("failed to determine workspace root")?;
-    let model = OpenAiCompatibleModel::from_workspace(&workspace_root)?;
+    let session_cache_key = Some(format!("ferrix-{}", Uuid::new_v4()));
+    let model =
+        OpenAiCompatibleModel::from_workspace_with_cache_key(&workspace_root, session_cache_key)?;
     let mcp = McpRegistry::from_workspace(&workspace_root).await?;
     let tools = ToolRegistry::with_mcp(workspace_root.clone(), mcp);
     let agent = Agent::new(model, tools, workspace_root);
     let mut history = agent::initial_history();
+    let mut session_last_response_id = None;
 
     let stdin = io::stdin();
 
@@ -52,13 +56,18 @@ async fn main() -> anyhow::Result<()> {
 
         let mut streamed_answer = false;
         match agent
-            .run_turn(input, &mut history, |delta| {
-                streamed_answer = true;
-                print!("{delta}");
-                io::stdout()
-                    .flush()
-                    .context("failed to flush streamed response")
-            })
+            .run_turn(
+                input,
+                &mut history,
+                &mut session_last_response_id,
+                |delta| {
+                    streamed_answer = true;
+                    print!("{delta}");
+                    io::stdout()
+                        .flush()
+                        .context("failed to flush streamed response")
+                },
+            )
             .await
         {
             Ok(_) if streamed_answer => println!(),
