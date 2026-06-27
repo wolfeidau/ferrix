@@ -4,14 +4,18 @@ mod logging;
 mod mcp;
 mod model;
 mod runs;
+mod terminal;
 mod tools;
 
-use std::io::{self, Write};
+use std::cell::RefCell;
+use std::io;
 
-use agent::Agent;
+use agent::{Agent, RunTurnError, SessionStats};
 use anyhow::Context;
+use config::UiConfig;
 use mcp::McpRegistry;
 use model::OpenAiCompatibleModel;
+use terminal::TerminalUi;
 use tools::ToolRegistry;
 use uuid::Uuid;
 
@@ -20,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
     logging::init();
 
     let workspace_root = std::env::current_dir().context("failed to determine workspace root")?;
+    let ui_config = UiConfig::from_workspace(&workspace_root)?;
     let session_cache_key = Some(format!("ferrix-{}", Uuid::new_v4()));
     let model =
         OpenAiCompatibleModel::from_workspace_with_cache_key(&workspace_root, session_cache_key)?;
@@ -28,12 +33,13 @@ async fn main() -> anyhow::Result<()> {
     let agent = Agent::new(model, tools, workspace_root);
     let mut history = agent::initial_history();
     let mut session_last_response_id = None;
+    let terminal = RefCell::new(TerminalUi::stdout(ui_config));
+    let mut session_stats = SessionStats::default();
 
     let stdin = io::stdin();
 
     loop {
-        print!("ferrix> ");
-        io::stdout().flush().context("failed to flush prompt")?;
+        terminal.borrow_mut().write_prompt()?;
 
         let mut input = String::new();
         let bytes_read = stdin
@@ -41,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to read user input")?;
 
         if bytes_read == 0 {
-            println!();
+            terminal.borrow_mut().finish_answer()?;
             break;
         }
 
@@ -62,20 +68,36 @@ async fn main() -> anyhow::Result<()> {
                 &mut session_last_response_id,
                 |delta| {
                     streamed_answer = true;
-                    print!("{delta}");
-                    io::stdout()
-                        .flush()
-                        .context("failed to flush streamed response")
+                    terminal.borrow_mut().write_answer_delta(delta)
                 },
+                |event| terminal.borrow_mut().handle_agent_event(&event),
             )
             .await
         {
-            Ok(_) if streamed_answer => println!(),
-            Ok(answer) if !answer.trim().is_empty() => println!("{answer}"),
-            Ok(_) => {}
-            Err(error) => eprintln!("error: {error:#}"),
+            Ok(result) if streamed_answer => {
+                session_stats.add_turn(&result.stats);
+                terminal.borrow_mut().finish_answer()?;
+            }
+            Ok(result) if !result.answer.trim().is_empty() => {
+                session_stats.add_turn(&result.stats);
+                terminal.borrow_mut().write_answer_delta(&result.answer)?;
+                terminal.borrow_mut().finish_answer()?;
+            }
+            Ok(result) => {
+                session_stats.add_turn(&result.stats);
+            }
+            Err(error) => {
+                if let Some(agent_error) = error.downcast_ref::<RunTurnError>() {
+                    session_stats.add_failed_turn(&agent_error.stats);
+                }
+                terminal.borrow_mut().write_error(&error)?;
+            }
         }
     }
+
+    terminal
+        .borrow_mut()
+        .write_session_summary(&session_stats)?;
 
     Ok(())
 }

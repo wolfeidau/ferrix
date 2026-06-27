@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, anyhow};
 use serde_json::json;
 use tracing::{debug, info, instrument, warn};
 
@@ -11,16 +11,16 @@ use crate::tools::{ToolCall, ToolDefinition, ToolRegistry};
 
 const MAX_AGENT_ITERATIONS: usize = 16;
 
-#[derive(Debug, Default, serde::Serialize)]
-struct ModelUsageTotals {
-    model_calls: usize,
-    duration_ms: u128,
-    input_tokens: u64,
-    output_tokens: u64,
-    reasoning_tokens: u64,
-    cached_input_tokens: u64,
-    total_tokens: u64,
-    missing_usage_iterations: Vec<usize>,
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ModelUsageTotals {
+    pub model_calls: usize,
+    pub duration_ms: u128,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub total_tokens: u64,
+    pub missing_usage_iterations: Vec<usize>,
 }
 
 impl ModelUsageTotals {
@@ -44,6 +44,18 @@ impl ModelUsageTotals {
         self.cached_input_tokens += usage_u64(usage, &["input_tokens_details", "cached_tokens"]);
         self.reasoning_tokens += usage_u64(usage, &["output_tokens_details", "reasoning_tokens"]);
     }
+
+    fn add_totals(&mut self, other: &Self) {
+        self.model_calls += other.model_calls;
+        self.duration_ms += other.duration_ms;
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.total_tokens += other.total_tokens;
+        self.missing_usage_iterations
+            .extend(other.missing_usage_iterations.iter().copied());
+    }
 }
 
 fn usage_u64(usage: &serde_json::Value, path: &[&str]) -> u64 {
@@ -51,6 +63,109 @@ fn usage_u64(usage: &serde_json::Value, path: &[&str]) -> u64 {
         .try_fold(usage, |value, key| value.get(*key))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ToolUsageTotals {
+    pub tool_calls: usize,
+    pub failed_tool_calls: usize,
+    pub duration_ms: u128,
+}
+
+impl ToolUsageTotals {
+    fn add_result(&mut self, ok: bool, duration_ms: u128) {
+        self.tool_calls += 1;
+        self.duration_ms += duration_ms;
+        if !ok {
+            self.failed_tool_calls += 1;
+        }
+    }
+
+    fn add_totals(&mut self, other: &Self) {
+        self.tool_calls += other.tool_calls;
+        self.failed_tool_calls += other.failed_tool_calls;
+        self.duration_ms += other.duration_ms;
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TurnStats {
+    pub model_usage: ModelUsageTotals,
+    pub tool_usage: ToolUsageTotals,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionStats {
+    pub turns: usize,
+    pub failed_turns: usize,
+    pub model_usage: ModelUsageTotals,
+    pub tool_usage: ToolUsageTotals,
+}
+
+impl SessionStats {
+    pub fn add_turn(&mut self, stats: &TurnStats) {
+        self.turns += 1;
+        self.model_usage.add_totals(&stats.model_usage);
+        self.tool_usage.add_totals(&stats.tool_usage);
+    }
+
+    pub fn add_failed_turn(&mut self, stats: &TurnStats) {
+        self.turns += 1;
+        self.failed_turns += 1;
+        self.model_usage.add_totals(&stats.model_usage);
+        self.tool_usage.add_totals(&stats.tool_usage);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RunTurnResult {
+    pub answer: String,
+    pub stats: TurnStats,
+}
+
+#[derive(Debug)]
+pub struct RunTurnError {
+    pub source: anyhow::Error,
+    pub stats: TurnStats,
+}
+
+impl std::fmt::Display for RunTurnError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.source)
+    }
+}
+
+impl std::error::Error for RunTurnError {}
+
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    ModelStarted {
+        iteration: usize,
+        model: String,
+    },
+    ModelCompleted {
+        iteration: usize,
+        model: String,
+        duration_ms: u128,
+        usage_totals: ModelUsageTotals,
+        tool_call_count: usize,
+    },
+    ToolStarted {
+        tag: String,
+        name: String,
+        call_id: String,
+    },
+    ToolCompleted {
+        tag: String,
+        name: String,
+        call_id: String,
+        ok: bool,
+        duration_ms: u128,
+        exit_code: Option<i64>,
+        stdout_bytes: Option<u64>,
+        stderr_bytes: Option<u64>,
+        truncated: bool,
+    },
 }
 
 pub fn initial_history() -> Vec<ConversationMessage> {
@@ -89,7 +204,8 @@ where
         history: &mut Vec<ConversationMessage>,
         session_last_response_id: &mut Option<String>,
         mut on_text_delta: impl FnMut(&str) -> Result<()>,
-    ) -> Result<String> {
+        mut on_event: impl FnMut(AgentEvent) -> Result<()>,
+    ) -> Result<RunTurnResult> {
         let recorder = RunRecorder::new(&self.workspace_root)?;
         let metadata = self.model.metadata();
         let prompt_cache = self.model.prompt_cache_settings();
@@ -109,6 +225,7 @@ where
 
         let tool_definitions = self.tools.definitions();
         let mut model_usage = ModelUsageTotals::default();
+        let mut tool_usage = ToolUsageTotals::default();
         let mut previous_response_id = store_responses
             .then(|| session_last_response_id.clone())
             .flatten();
@@ -124,6 +241,10 @@ where
             };
 
             debug!(iteration, "agent iteration started");
+            on_event(AgentEvent::ModelStarted {
+                iteration,
+                model: metadata.model.clone(),
+            })?;
             recorder.record(
                 "model_request",
                 json!({
@@ -147,6 +268,10 @@ where
             {
                 Ok(response) => response,
                 Err(error) => {
+                    let stats = TurnStats {
+                        model_usage: model_usage.clone(),
+                        tool_usage: tool_usage.clone(),
+                    };
                     recorder.record(
                         "run_completed",
                         json!({
@@ -155,11 +280,22 @@ where
                             "model_usage": model_usage
                         }),
                     )?;
-                    return Err(error).context("model completion failed");
+                    return Err(RunTurnError {
+                        source: error.context("model completion failed"),
+                        stats,
+                    }
+                    .into());
                 }
             };
             let model_duration_ms = model_started.elapsed().as_millis();
             model_usage.add_response(iteration, model_duration_ms, response.usage.as_ref());
+            on_event(AgentEvent::ModelCompleted {
+                iteration,
+                model: metadata.model.clone(),
+                duration_ms: model_duration_ms,
+                usage_totals: model_usage.clone(),
+                tool_call_count: response.tool_calls.len(),
+            })?;
 
             if let Some(usage) = &response.usage {
                 let cached_tokens = usage_u64(usage, &["input_tokens_details", "cached_tokens"]);
@@ -207,8 +343,14 @@ where
                     response.response_items.clone(),
                 ));
                 let tool_results_start = history.len();
-                self.execute_tool_calls(&recorder, &response.tool_calls, history)
-                    .await?;
+                self.execute_tool_calls(
+                    &recorder,
+                    &response.tool_calls,
+                    history,
+                    &mut on_event,
+                    &mut tool_usage,
+                )
+                .await?;
                 if store_responses && response_id.is_some() {
                     incremental_messages = Some(history[tool_results_start..].to_vec());
                 }
@@ -230,7 +372,13 @@ where
                 }),
             )?;
             info!(run_id = %recorder.run_id(), "agent run completed");
-            return Ok(answer);
+            return Ok(RunTurnResult {
+                answer,
+                stats: TurnStats {
+                    model_usage,
+                    tool_usage,
+                },
+            });
         }
 
         recorder.record(
@@ -241,7 +389,14 @@ where
                 "model_usage": model_usage
             }),
         )?;
-        bail!("agent reached the maximum of {MAX_AGENT_ITERATIONS} iterations");
+        Err(RunTurnError {
+            source: anyhow!("agent reached the maximum of {MAX_AGENT_ITERATIONS} iterations"),
+            stats: TurnStats {
+                model_usage,
+                tool_usage,
+            },
+        }
+        .into())
     }
 
     async fn execute_tool_calls(
@@ -249,14 +404,54 @@ where
         recorder: &RunRecorder,
         tool_calls: &[ToolCall],
         history: &mut Vec<ConversationMessage>,
+        on_event: &mut impl FnMut(AgentEvent) -> Result<()>,
+        tool_usage: &mut ToolUsageTotals,
     ) -> Result<()> {
         for call in tool_calls {
             recorder.record("tool_call", call)?;
+            let tag = terminal_tag(call);
+            on_event(AgentEvent::ToolStarted {
+                tag: tag.clone(),
+                name: call.name.clone(),
+                call_id: call.call_id.clone(),
+            })?;
+            let tool_started = Instant::now();
             let result = self.tools.execute(call).await;
+            let duration_ms = tool_started.elapsed().as_millis();
 
             if !result.ok {
                 warn!(tool = %result.name, call_id = %result.call_id, "tool returned an error");
             }
+            tool_usage.add_result(result.ok, duration_ms);
+            on_event(AgentEvent::ToolCompleted {
+                tag,
+                name: result.name.clone(),
+                call_id: result.call_id.clone(),
+                ok: result.ok,
+                duration_ms,
+                exit_code: result
+                    .data
+                    .get("exit_code")
+                    .and_then(serde_json::Value::as_i64),
+                stdout_bytes: result
+                    .data
+                    .get("stdout_bytes")
+                    .and_then(serde_json::Value::as_u64),
+                stderr_bytes: result
+                    .data
+                    .get("stderr_bytes")
+                    .and_then(serde_json::Value::as_u64),
+                truncated: result
+                    .data
+                    .get("stdout_truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    || result
+                        .data
+                        .get("stderr_truncated")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+            })?;
 
             recorder.record("tool_result", &result)?;
             history.push(ConversationMessage::tool_result(
@@ -267,6 +462,24 @@ where
 
         Ok(())
     }
+}
+
+fn terminal_tag(call: &ToolCall) -> String {
+    if call.name == "mcp_call" {
+        let server = call
+            .arguments
+            .get("server")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let tool = call
+            .arguments
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        return format!("[MCP:{server}/{tool}]");
+    }
+
+    format!("[TOOL:{}]", call.name)
 }
 
 #[cfg(test)]
@@ -435,7 +648,8 @@ mod tests {
         let mut session_last_response_id = None;
         let mut streamed = String::new();
 
-        let answer = agent
+        let mut events = Vec::new();
+        let result = agent
             .run_turn(
                 "hello",
                 &mut history,
@@ -444,13 +658,30 @@ mod tests {
                     streamed.push_str(delta);
                     Ok(())
                 },
+                |event| {
+                    events.push(event);
+                    Ok(())
+                },
             )
             .await
             .expect("run turn");
 
-        assert_eq!(answer, "final answer");
+        assert_eq!(result.answer, "final answer");
+        assert_eq!(result.stats.model_usage.model_calls, 2);
+        assert_eq!(result.stats.tool_usage.tool_calls, 1);
+        assert_eq!(result.stats.tool_usage.failed_tool_calls, 1);
         assert_eq!(streamed, "final answer");
         assert_eq!(session_last_response_id, None);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolCompleted {
+                    tag,
+                    ok: false,
+                    ..
+                } if tag == "[TOOL:unknown]"
+            )
+        }));
 
         let runs_dir = workspace.join(".ferrix").join("runs");
         let run_file = fs::read_dir(&runs_dir)
@@ -574,6 +805,7 @@ mod tests {
                 &mut history,
                 &mut session_last_response_id,
                 |_delta| Ok(()),
+                |_event| Ok(()),
             )
             .await
             .expect_err("max iteration error");
@@ -581,6 +813,18 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!("agent reached the maximum of {MAX_AGENT_ITERATIONS} iterations")
+        );
+        let run_error = error
+            .downcast_ref::<RunTurnError>()
+            .expect("run turn error");
+        assert_eq!(
+            run_error.stats.model_usage.model_calls,
+            MAX_AGENT_ITERATIONS
+        );
+        assert_eq!(run_error.stats.tool_usage.tool_calls, MAX_AGENT_ITERATIONS);
+        assert_eq!(
+            run_error.stats.tool_usage.failed_tool_calls,
+            MAX_AGENT_ITERATIONS
         );
 
         let runs_dir = workspace.join(".ferrix").join("runs");
@@ -658,17 +902,18 @@ mod tests {
         let mut history = initial_history();
         let mut session_last_response_id = None;
 
-        let answer = agent
+        let result = agent
             .run_turn(
                 "hello",
                 &mut history,
                 &mut session_last_response_id,
                 |_delta| Ok(()),
+                |_event| Ok(()),
             )
             .await
             .expect("run turn");
 
-        assert_eq!(answer, "final answer");
+        assert_eq!(result.answer, "final answer");
         let captured = model.captured_requests();
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0].message_count, 2);
@@ -719,6 +964,7 @@ mod tests {
                 &mut history,
                 &mut session_last_response_id,
                 |_delta| Ok(()),
+                |_event| Ok(()),
             )
             .await
             .expect("first turn");
@@ -728,6 +974,7 @@ mod tests {
                 &mut history,
                 &mut session_last_response_id,
                 |_delta| Ok(()),
+                |_event| Ok(()),
             )
             .await
             .expect("second turn");
@@ -783,6 +1030,7 @@ mod tests {
                 &mut history,
                 &mut session_last_response_id,
                 |_delta| Ok(()),
+                |_event| Ok(()),
             )
             .await
             .expect("run turn");
