@@ -29,9 +29,10 @@ async fn main() -> anyhow::Result<()> {
     let model =
         OpenAiCompatibleModel::from_workspace_with_cache_key(&workspace_root, session_cache_key)?;
     let mcp = McpRegistry::from_workspace(&workspace_root).await?;
+    let mcp_instructions = mcp.server_instructions().to_vec();
     let tools = ToolRegistry::with_mcp(workspace_root.clone(), mcp);
     let agent = Agent::new(model, tools, workspace_root);
-    let mut history = agent::initial_history();
+    let mut history = agent::initial_history_with_mcp(&mcp_instructions);
     let mut session_last_response_id = None;
     let terminal = RefCell::new(TerminalUi::stdout(ui_config));
     let mut session_stats = SessionStats::default();
