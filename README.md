@@ -82,6 +82,19 @@ cargo run
 
 Then enter a request at the prompt. Use `exit`, `quit`, or EOF to leave the session.
 
+Run a single prompt and exit with:
+
+```sh
+cargo run -- --prompt "summarize this repo"
+cargo run -- -p "summarize this repo"
+```
+
+Print the Ferrix version with:
+
+```sh
+cargo run -- --version
+```
+
 The agent can use these local tools:
 
 - `read`: read a UTF-8 text file.
