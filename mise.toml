@@ -16,3 +16,7 @@ zig = "latest"
 [tasks.lint]
 description = "Run formatting and clippy checks"
 run = "bash -o pipefail -c 'cargo fmt --check && cargo clippy --all-targets --all-features --locked --message-format=json -- -D warnings | clippy-sarif | tee clippy.sarif | sarif-fmt'"
+
+[tasks.release-check]
+description = "Build a single-target snapshot release with GoReleaser"
+run = "goreleaser build --single-target --clean --snapshot"
