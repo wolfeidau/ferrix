@@ -7,8 +7,8 @@ use async_openai::{
     types::responses::{
         CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
         FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem, InputParam, Item,
-        OutputItem, OutputStatus, Reasoning, ReasoningEffort, ResponseStreamEvent, Role, Tool,
-        ToolChoiceOptions, ToolChoiceParam,
+        OutputItem, OutputStatus, PromptCacheRetention, Reasoning, ReasoningEffort,
+        ResponseStreamEvent, Role, Tool, ToolChoiceOptions, ToolChoiceParam,
     },
 };
 use futures_util::StreamExt;
@@ -95,6 +95,19 @@ pub struct ModelMetadata {
     pub endpoint: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptCacheSettings {
+    pub retention: Option<String>,
+    pub key: Option<String>,
+    pub store_responses: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ModelTurnContext {
+    pub previous_response_id: Option<String>,
+    pub incremental: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelResponse {
     pub content: Option<String>,
@@ -102,15 +115,21 @@ pub struct ModelResponse {
     pub response_items: Vec<Value>,
     pub usage: Option<Value>,
     pub execution_plan: Option<Value>,
+    pub response_id: Option<String>,
 }
 
 pub trait Model {
     fn metadata(&self) -> ModelMetadata;
 
+    fn prompt_cache_settings(&self) -> PromptCacheSettings;
+
+    fn store_responses(&self) -> bool;
+
     async fn complete_streaming(
         &self,
         messages: &[ConversationMessage],
         tools: &[ToolDefinition],
+        context: &ModelTurnContext,
         on_text_delta: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<ModelResponse>;
 }
@@ -128,16 +147,29 @@ pub struct OpenAiCompatibleModel {
     max_output_tokens: Option<u32>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    prompt_cache_retention: Option<PromptCacheRetention>,
+    prompt_cache_key: Option<String>,
+    store_responses: bool,
 }
 
 impl OpenAiCompatibleModel {
+    #[allow(dead_code)]
     pub fn from_workspace(workspace_root: &Path) -> Result<Self> {
-        let model_config = ModelConfig::from_workspace(workspace_root)?;
+        Self::from_workspace_with_cache_key(workspace_root, None)
+    }
+
+    pub fn from_workspace_with_cache_key(
+        workspace_root: &Path,
+        session_cache_key: Option<String>,
+    ) -> Result<Self> {
+        let model_config =
+            ModelConfig::from_workspace(workspace_root)?.with_prompt_cache_key(session_cache_key);
         Self::from_config(model_config)
     }
 
     fn from_config(model_config: ModelConfig) -> Result<Self> {
         let config = openai_config(&model_config)?;
+        let prompt_cache = model_config.prompt_cache;
 
         Ok(Self {
             client: Client::with_config(config),
@@ -151,6 +183,9 @@ impl OpenAiCompatibleModel {
             max_output_tokens: model_config.max_output_tokens,
             temperature: model_config.temperature,
             top_p: model_config.top_p,
+            prompt_cache_retention: prompt_cache.retention,
+            prompt_cache_key: prompt_cache.key,
+            store_responses: prompt_cache.store_responses,
         })
     }
 
@@ -158,6 +193,7 @@ impl OpenAiCompatibleModel {
         &self,
         messages: &[ConversationMessage],
         tools: &[ToolDefinition],
+        context: &ModelTurnContext,
     ) -> Result<CreateResponse> {
         Ok(CreateResponse {
             model: Some(self.model.clone()),
@@ -166,7 +202,10 @@ impl OpenAiCompatibleModel {
             tool_choice: (!tools.is_empty())
                 .then_some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto)),
             stream: Some(true),
-            store: Some(false),
+            store: Some(self.store_responses),
+            previous_response_id: context.previous_response_id.clone(),
+            prompt_cache_key: self.prompt_cache_key.clone(),
+            prompt_cache_retention: self.prompt_cache_retention,
             max_output_tokens: self.max_output_tokens,
             temperature: self.temperature,
             top_p: self.top_p,
@@ -176,6 +215,23 @@ impl OpenAiCompatibleModel {
             }),
             ..Default::default()
         })
+    }
+
+    fn prompt_cache_settings(&self) -> PromptCacheSettings {
+        PromptCacheSettings {
+            retention: self
+                .prompt_cache_retention
+                .map(prompt_cache_retention_label),
+            key: self.prompt_cache_key.clone(),
+            store_responses: self.store_responses,
+        }
+    }
+}
+
+fn prompt_cache_retention_label(retention: PromptCacheRetention) -> String {
+    match retention {
+        PromptCacheRetention::InMemory => "in_memory".to_string(),
+        PromptCacheRetention::Hours24 => "24h".to_string(),
     }
 }
 
@@ -188,22 +244,33 @@ impl Model for OpenAiCompatibleModel {
         }
     }
 
+    fn prompt_cache_settings(&self) -> PromptCacheSettings {
+        self.prompt_cache_settings()
+    }
+
+    fn store_responses(&self) -> bool {
+        self.store_responses
+    }
+
     #[instrument(skip_all, fields(model = %self.model, api_base = %self.api_base))]
     async fn complete_streaming(
         &self,
         messages: &[ConversationMessage],
         tools: &[ToolDefinition],
+        context: &ModelTurnContext,
         on_text_delta: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<ModelResponse> {
         self.api_key
             .as_deref()
             .with_context(|| format!("set {} to call the model", self.api_key_env_var))?;
 
-        let request = self.response_request(messages, tools)?;
+        let request = self.response_request(messages, tools, context)?;
 
         debug!(
             message_count = messages.len(),
             tool_count = tools.len(),
+            incremental = context.incremental,
+            previous_response_id = ?context.previous_response_id,
             "sending streaming responses request"
         );
 
@@ -353,6 +420,7 @@ struct StreamAccumulator {
     response_items: Vec<Value>,
     usage: Option<Value>,
     execution_plans: Vec<Value>,
+    response_id: Option<String>,
 }
 
 impl StreamAccumulator {
@@ -389,6 +457,7 @@ impl StreamAccumulator {
                 self.apply_output_item(event.output_index, event.item);
             }
             ResponseStreamEvent::ResponseCompleted(event) => {
+                self.response_id = Some(event.response.id.clone());
                 if let Some(usage) = event.response.usage {
                     self.set_usage(usage);
                 }
@@ -471,6 +540,7 @@ impl StreamAccumulator {
                 .collect(),
             usage: self.usage,
             execution_plan: execution_plan_from_many(self.execution_plans),
+            response_id: self.response_id,
         })
     }
 }
@@ -554,7 +624,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
-    use crate::config::OpenRouterConfig;
+    use crate::config::{OpenRouterConfig, PromptCacheConfig};
 
     use super::*;
 
@@ -569,7 +639,11 @@ mod tests {
         };
 
         let request = model
-            .response_request(&[ConversationMessage::user("hello")], &[])
+            .response_request(
+                &[ConversationMessage::user("hello")],
+                &[],
+                &ModelTurnContext::default(),
+            )
             .expect("build request");
 
         assert_eq!(request.max_output_tokens, Some(4096));
@@ -586,7 +660,12 @@ mod tests {
         };
 
         let error = model
-            .complete_streaming(&[ConversationMessage::user("hello")], &[], &mut |_| Ok(()))
+            .complete_streaming(
+                &[ConversationMessage::user("hello")],
+                &[],
+                &ModelTurnContext::default(),
+                &mut |_| Ok(()),
+            )
             .await
             .expect_err("missing key should fail");
 
@@ -611,6 +690,7 @@ mod tests {
                 title: Some("Ferrix".to_string()),
                 categories: Some("cli-agent".to_string()),
             },
+            prompt_cache: PromptCacheConfig::default(),
         };
 
         let headers = openai_config(&config).expect("build config").headers();
@@ -642,23 +722,44 @@ mod tests {
     }
 
     #[test]
-    fn response_request_disables_remote_storage() {
+    fn response_request_sets_prompt_cache_options() {
         let model = OpenAiCompatibleModel {
-            client: Client::with_config(OpenAIConfig::new().with_api_key("test")),
-            provider: "test".to_string(),
-            model: "gpt-test".to_string(),
-            api_base: "https://api.openai.com/v1".to_string(),
-            endpoint: "https://api.openai.com/v1/responses".to_string(),
-            api_key: Some("test".to_string()),
-            api_key_env_var: "OPENAI_API_KEY",
-            reasoning_effort: None,
-            max_output_tokens: None,
-            temperature: None,
-            top_p: None,
+            prompt_cache_retention: Some(PromptCacheRetention::Hours24),
+            prompt_cache_key: Some("session-key".to_string()),
+            store_responses: true,
+            ..test_model()
         };
 
         let request = model
-            .response_request(&[ConversationMessage::user("hello")], &[])
+            .response_request(
+                &[ConversationMessage::user("hello")],
+                &[],
+                &ModelTurnContext {
+                    previous_response_id: Some("resp_prev".to_string()),
+                    incremental: true,
+                },
+            )
+            .expect("build request");
+
+        assert_eq!(
+            request.prompt_cache_retention,
+            Some(PromptCacheRetention::Hours24)
+        );
+        assert_eq!(request.prompt_cache_key.as_deref(), Some("session-key"));
+        assert_eq!(request.store, Some(true));
+        assert_eq!(request.previous_response_id.as_deref(), Some("resp_prev"));
+    }
+
+    #[test]
+    fn response_request_disables_remote_storage_by_default() {
+        let model = test_model();
+
+        let request = model
+            .response_request(
+                &[ConversationMessage::user("hello")],
+                &[],
+                &ModelTurnContext::default(),
+            )
             .expect("build request");
 
         assert_eq!(request.stream, Some(true));
@@ -668,21 +769,16 @@ mod tests {
     #[test]
     fn response_request_sets_configured_reasoning_effort() {
         let model = OpenAiCompatibleModel {
-            client: Client::with_config(OpenAIConfig::new().with_api_key("test")),
-            provider: "test".to_string(),
-            model: "gpt-test".to_string(),
-            api_base: "https://api.openai.com/v1".to_string(),
-            endpoint: "https://api.openai.com/v1/responses".to_string(),
-            api_key: Some("test".to_string()),
-            api_key_env_var: "OPENAI_API_KEY",
             reasoning_effort: Some(ReasoningEffort::Low),
-            max_output_tokens: None,
-            temperature: None,
-            top_p: None,
+            ..test_model()
         };
 
         let request = model
-            .response_request(&[ConversationMessage::user("hello")], &[])
+            .response_request(
+                &[ConversationMessage::user("hello")],
+                &[],
+                &ModelTurnContext::default(),
+            )
             .expect("build request");
 
         assert_eq!(
@@ -693,19 +789,7 @@ mod tests {
 
     #[test]
     fn response_request_enables_strict_function_tools() {
-        let model = OpenAiCompatibleModel {
-            client: Client::with_config(OpenAIConfig::new().with_api_key("test")),
-            provider: "test".to_string(),
-            model: "gpt-test".to_string(),
-            api_base: "https://api.openai.com/v1".to_string(),
-            endpoint: "https://api.openai.com/v1/responses".to_string(),
-            api_key: Some("test".to_string()),
-            api_key_env_var: "OPENAI_API_KEY",
-            reasoning_effort: None,
-            max_output_tokens: None,
-            temperature: None,
-            top_p: None,
-        };
+        let model = test_model();
         let tools = vec![ToolDefinition {
             name: "read".to_string(),
             description: "Read a file".to_string(),
@@ -720,7 +804,11 @@ mod tests {
         }];
 
         let request = model
-            .response_request(&[ConversationMessage::user("hello")], &tools)
+            .response_request(
+                &[ConversationMessage::user("hello")],
+                &tools,
+                &ModelTurnContext::default(),
+            )
             .expect("build request");
         let tools = request.tools.expect("tools");
 
@@ -959,6 +1047,34 @@ mod tests {
         )
     }
 
+    #[test]
+    fn captures_response_id_from_completed_stream() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator
+            .apply_event(text_delta_event("hello"), &mut |_| Ok(()))
+            .expect("text delta");
+        let event: ResponseStreamEvent = serde_json::from_value(json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_123",
+                "created_at": 0,
+                "model": "gpt-test",
+                "object": "response",
+                "output": [],
+                "status": "completed"
+            }
+        }))
+        .expect("completed event");
+        accumulator
+            .apply_event(event, &mut |_| Ok(()))
+            .expect("completed event");
+
+        let response = accumulator.finish().expect("finish response");
+
+        assert_eq!(response.response_id.as_deref(), Some("resp_123"));
+    }
+
     fn test_model() -> OpenAiCompatibleModel {
         OpenAiCompatibleModel {
             client: Client::with_config(OpenAIConfig::new().with_api_key("test")),
@@ -972,6 +1088,9 @@ mod tests {
             max_output_tokens: None,
             temperature: None,
             top_p: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            store_responses: false,
         }
     }
 }

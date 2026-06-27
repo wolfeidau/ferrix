@@ -5,9 +5,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 use tracing::{debug, info, instrument, warn};
 
-use crate::model::{ConversationMessage, Model};
+use crate::model::{ConversationMessage, Model, ModelTurnContext};
 use crate::runs::RunRecorder;
-use crate::tools::{ToolCall, ToolRegistry};
+use crate::tools::{ToolCall, ToolDefinition, ToolRegistry};
 
 const MAX_AGENT_ITERATIONS: usize = 16;
 
@@ -87,16 +87,20 @@ where
         &self,
         user_input: &str,
         history: &mut Vec<ConversationMessage>,
+        session_last_response_id: &mut Option<String>,
         mut on_text_delta: impl FnMut(&str) -> Result<()>,
     ) -> Result<String> {
         let recorder = RunRecorder::new(&self.workspace_root)?;
         let metadata = self.model.metadata();
+        let prompt_cache = self.model.prompt_cache_settings();
+        let store_responses = self.model.store_responses();
 
         recorder.record(
             "run_started",
             json!({
                 "prompt": user_input,
-                "model": metadata
+                "model": metadata,
+                "prompt_cache": prompt_cache
             }),
         )?;
 
@@ -105,15 +109,29 @@ where
 
         let tool_definitions = self.tools.definitions();
         let mut model_usage = ModelUsageTotals::default();
+        let mut previous_response_id = store_responses
+            .then(|| session_last_response_id.clone())
+            .flatten();
+        let mut incremental_messages: Option<Vec<ConversationMessage>> = None;
 
         for iteration in 1..=MAX_AGENT_ITERATIONS {
+            let incremental = incremental_messages.take();
+            let messages = incremental.as_deref().unwrap_or(history.as_slice());
+            let tools: &[ToolDefinition] = &tool_definitions;
+            let context = ModelTurnContext {
+                previous_response_id: previous_response_id.clone(),
+                incremental: incremental.is_some(),
+            };
+
             debug!(iteration, "agent iteration started");
             recorder.record(
                 "model_request",
                 json!({
                     "iteration": iteration,
-                    "message_count": history.len(),
-                    "tool_count": tool_definitions.len()
+                    "message_count": messages.len(),
+                    "tool_count": tools.len(),
+                    "incremental": context.incremental,
+                    "previous_response_id": context.previous_response_id
                 }),
             )?;
 
@@ -121,7 +139,7 @@ where
             let model_started = Instant::now();
             let response = match self
                 .model
-                .complete_streaming(history, &tool_definitions, &mut |delta| {
+                .complete_streaming(messages, tools, &context, &mut |delta| {
                     streamed_text.push_str(delta);
                     Ok(())
                 })
@@ -142,6 +160,19 @@ where
             };
             let model_duration_ms = model_started.elapsed().as_millis();
             model_usage.add_response(iteration, model_duration_ms, response.usage.as_ref());
+
+            if let Some(usage) = &response.usage {
+                let cached_tokens = usage_u64(usage, &["input_tokens_details", "cached_tokens"]);
+                if cached_tokens > 0 {
+                    debug!(
+                        iteration,
+                        cached_tokens, "prompt cache hit reported by model"
+                    );
+                }
+            }
+
+            let response_id = response.response_id.clone();
+            previous_response_id = store_responses.then(|| response_id.clone()).flatten();
 
             if let Some(plan) = &response.execution_plan {
                 recorder.record(
@@ -164,6 +195,7 @@ where
                     "response_items": response.response_items.clone(),
                     "duration_ms": model_duration_ms,
                     "usage": response.usage.clone(),
+                    "response_id": response.response_id,
                     "has_execution_plan": response.execution_plan.is_some()
                 }),
             )?;
@@ -174,8 +206,12 @@ where
                     response.tool_calls.clone(),
                     response.response_items.clone(),
                 ));
+                let tool_results_start = history.len();
                 self.execute_tool_calls(&recorder, &response.tool_calls, history)
                     .await?;
+                if store_responses && response_id.is_some() {
+                    incremental_messages = Some(history[tool_results_start..].to_vec());
+                }
                 continue;
             }
 
@@ -184,6 +220,7 @@ where
                 on_text_delta(&streamed_text)?;
             }
             history.push(ConversationMessage::assistant(answer.clone()));
+            *session_last_response_id = store_responses.then_some(response.response_id).flatten();
             recorder.record(
                 "run_completed",
                 json!({
@@ -243,19 +280,58 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::model::{ModelMetadata, ModelResponse};
+    use crate::model::{ModelMetadata, ModelResponse, ModelTurnContext, PromptCacheSettings};
     use crate::tools::ToolDefinition;
 
-    #[derive(Debug)]
+    use std::sync::Arc;
+
+    #[derive(Debug, Clone)]
     struct MockModel {
+        inner: Arc<MockModelInner>,
+    }
+
+    #[derive(Debug)]
+    struct MockModelInner {
         responses: Mutex<VecDeque<ModelResponse>>,
+        store_responses: bool,
+        captured_requests: Mutex<Vec<CapturedRequest>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CapturedRequest {
+        message_count: usize,
+        tool_count: usize,
+        incremental: bool,
+        previous_response_id: Option<String>,
     }
 
     impl MockModel {
         fn new(responses: impl IntoIterator<Item = ModelResponse>) -> Self {
             Self {
-                responses: Mutex::new(responses.into_iter().collect()),
+                inner: Arc::new(MockModelInner {
+                    responses: Mutex::new(responses.into_iter().collect()),
+                    store_responses: false,
+                    captured_requests: Mutex::new(Vec::new()),
+                }),
             }
+        }
+
+        fn with_store_responses(responses: impl IntoIterator<Item = ModelResponse>) -> Self {
+            Self {
+                inner: Arc::new(MockModelInner {
+                    responses: Mutex::new(responses.into_iter().collect()),
+                    store_responses: true,
+                    captured_requests: Mutex::new(Vec::new()),
+                }),
+            }
+        }
+
+        fn captured_requests(&self) -> Vec<CapturedRequest> {
+            self.inner
+                .captured_requests
+                .lock()
+                .expect("lock captured requests")
+                .clone()
         }
     }
 
@@ -268,13 +344,38 @@ mod tests {
             }
         }
 
+        fn prompt_cache_settings(&self) -> PromptCacheSettings {
+            PromptCacheSettings {
+                retention: None,
+                key: None,
+                store_responses: self.inner.store_responses,
+            }
+        }
+
+        fn store_responses(&self) -> bool {
+            self.inner.store_responses
+        }
+
         async fn complete_streaming(
             &self,
-            _messages: &[ConversationMessage],
-            _tools: &[ToolDefinition],
+            messages: &[ConversationMessage],
+            tools: &[ToolDefinition],
+            context: &ModelTurnContext,
             on_text_delta: &mut dyn FnMut(&str) -> Result<()>,
         ) -> Result<ModelResponse> {
+            self.inner
+                .captured_requests
+                .lock()
+                .expect("lock captured requests")
+                .push(CapturedRequest {
+                    message_count: messages.len(),
+                    tool_count: tools.len(),
+                    incremental: context.incremental,
+                    previous_response_id: context.previous_response_id.clone(),
+                });
+
             let response = self
+                .inner
                 .responses
                 .lock()
                 .expect("lock responses")
@@ -317,6 +418,7 @@ mod tests {
                     "output_tokens_details": { "reasoning_tokens": 4 }
                 })),
                 execution_plan: None,
+                response_id: Some("resp_tool".to_string()),
             },
             ModelResponse {
                 content: Some("final answer".to_string()),
@@ -324,23 +426,31 @@ mod tests {
                 response_items: Vec::new(),
                 usage: None,
                 execution_plan: None,
+                response_id: Some("resp_final".to_string()),
             },
         ]);
         let tools = ToolRegistry::new(workspace.clone());
         let agent = Agent::new(model, tools, workspace.clone());
         let mut history = initial_history();
+        let mut session_last_response_id = None;
         let mut streamed = String::new();
 
         let answer = agent
-            .run_turn("hello", &mut history, |delta| {
-                streamed.push_str(delta);
-                Ok(())
-            })
+            .run_turn(
+                "hello",
+                &mut history,
+                &mut session_last_response_id,
+                |delta| {
+                    streamed.push_str(delta);
+                    Ok(())
+                },
+            )
             .await
             .expect("run turn");
 
         assert_eq!(answer, "final answer");
         assert_eq!(streamed, "final answer");
+        assert_eq!(session_last_response_id, None);
 
         let runs_dir = workspace.join(".ferrix").join("runs");
         let run_file = fs::read_dir(&runs_dir)
@@ -354,6 +464,15 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse event"))
             .collect::<Vec<_>>();
+        let started_event = events
+            .iter()
+            .find(|event| event["kind"] == "run_started")
+            .expect("run started event");
+        assert_eq!(
+            started_event["payload"]["prompt_cache"]["store_responses"],
+            false
+        );
+
         let tool_response_event = events
             .iter()
             .find(|event| {
@@ -441,14 +560,21 @@ mod tests {
                 "total_tokens": iteration + 1
             })),
             execution_plan: None,
+            response_id: None,
         });
         let model = MockModel::new(responses);
         let tools = ToolRegistry::new(workspace.clone());
         let agent = Agent::new(model, tools, workspace.clone());
         let mut history = initial_history();
+        let mut session_last_response_id = None;
 
         let error = agent
-            .run_turn("hello", &mut history, |_delta| Ok(()))
+            .run_turn(
+                "hello",
+                &mut history,
+                &mut session_last_response_id,
+                |_delta| Ok(()),
+            )
             .await
             .expect_err("max iteration error");
 
@@ -496,6 +622,181 @@ mod tests {
             completed_event["payload"]["model_usage"]["missing_usage_iterations"],
             json!([])
         );
+
+        fs::remove_dir_all(workspace).expect("remove workspace");
+    }
+
+    #[tokio::test]
+    async fn uses_incremental_messages_when_store_responses_enabled() {
+        let workspace = std::env::temp_dir().join(format!("ferrix-agent-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let model = MockModel::with_store_responses([
+            ModelResponse {
+                content: Some("tool preface".to_string()),
+                tool_calls: vec![ToolCall {
+                    call_id: "call_1".to_string(),
+                    item_id: Some("fc_1".to_string()),
+                    name: "unknown".to_string(),
+                    arguments: json!({}),
+                }],
+                response_items: Vec::new(),
+                usage: None,
+                execution_plan: None,
+                response_id: Some("resp_tool".to_string()),
+            },
+            ModelResponse {
+                content: Some("final answer".to_string()),
+                tool_calls: Vec::new(),
+                response_items: Vec::new(),
+                usage: None,
+                execution_plan: None,
+                response_id: Some("resp_final".to_string()),
+            },
+        ]);
+        let tools = ToolRegistry::new(workspace.clone());
+        let agent = Agent::new(model.clone(), tools, workspace.clone());
+        let mut history = initial_history();
+        let mut session_last_response_id = None;
+
+        let answer = agent
+            .run_turn(
+                "hello",
+                &mut history,
+                &mut session_last_response_id,
+                |_delta| Ok(()),
+            )
+            .await
+            .expect("run turn");
+
+        assert_eq!(answer, "final answer");
+        let captured = model.captured_requests();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].message_count, 2);
+        assert!(captured[0].tool_count > 0);
+        assert!(!captured[0].incremental);
+        assert_eq!(captured[0].previous_response_id, None);
+        assert_eq!(captured[1].message_count, 1);
+        assert_eq!(captured[1].tool_count, captured[0].tool_count);
+        assert!(captured[1].incremental);
+        assert_eq!(
+            captured[1].previous_response_id.as_deref(),
+            Some("resp_tool")
+        );
+
+        fs::remove_dir_all(workspace).expect("remove workspace");
+    }
+
+    #[tokio::test]
+    async fn does_not_chain_response_ids_when_store_responses_disabled() {
+        let workspace = std::env::temp_dir().join(format!("ferrix-agent-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let model = MockModel::new([
+            ModelResponse {
+                content: Some("first".to_string()),
+                tool_calls: Vec::new(),
+                response_items: Vec::new(),
+                usage: None,
+                execution_plan: None,
+                response_id: Some("resp_first".to_string()),
+            },
+            ModelResponse {
+                content: Some("second".to_string()),
+                tool_calls: Vec::new(),
+                response_items: Vec::new(),
+                usage: None,
+                execution_plan: None,
+                response_id: Some("resp_second".to_string()),
+            },
+        ]);
+        let tools = ToolRegistry::new(workspace.clone());
+        let agent = Agent::new(model.clone(), tools, workspace.clone());
+        let mut history = initial_history();
+        let mut session_last_response_id = None;
+
+        agent
+            .run_turn(
+                "one",
+                &mut history,
+                &mut session_last_response_id,
+                |_delta| Ok(()),
+            )
+            .await
+            .expect("first turn");
+        agent
+            .run_turn(
+                "two",
+                &mut history,
+                &mut session_last_response_id,
+                |_delta| Ok(()),
+            )
+            .await
+            .expect("second turn");
+
+        assert_eq!(session_last_response_id, None);
+        assert_eq!(
+            model
+                .captured_requests()
+                .into_iter()
+                .map(|request| request.previous_response_id)
+                .collect::<Vec<_>>(),
+            vec![None, None]
+        );
+
+        fs::remove_dir_all(workspace).expect("remove workspace");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_full_history_when_store_response_id_is_missing() {
+        let workspace = std::env::temp_dir().join(format!("ferrix-agent-{}", Uuid::new_v4()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let model = MockModel::with_store_responses([
+            ModelResponse {
+                content: Some("tool preface".to_string()),
+                tool_calls: vec![ToolCall {
+                    call_id: "call_1".to_string(),
+                    item_id: Some("fc_1".to_string()),
+                    name: "unknown".to_string(),
+                    arguments: json!({}),
+                }],
+                response_items: Vec::new(),
+                usage: None,
+                execution_plan: None,
+                response_id: None,
+            },
+            ModelResponse {
+                content: Some("final answer".to_string()),
+                tool_calls: Vec::new(),
+                response_items: Vec::new(),
+                usage: None,
+                execution_plan: None,
+                response_id: Some("resp_final".to_string()),
+            },
+        ]);
+        let tools = ToolRegistry::new(workspace.clone());
+        let agent = Agent::new(model.clone(), tools, workspace.clone());
+        let mut history = initial_history();
+        let mut session_last_response_id = None;
+
+        agent
+            .run_turn(
+                "hello",
+                &mut history,
+                &mut session_last_response_id,
+                |_delta| Ok(()),
+            )
+            .await
+            .expect("run turn");
+
+        let captured = model.captured_requests();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].message_count, 2);
+        assert!(captured[0].tool_count > 0);
+        assert!(!captured[0].incremental);
+        assert_eq!(captured[0].previous_response_id, None);
+        assert_eq!(captured[1].message_count, 4);
+        assert_eq!(captured[1].tool_count, captured[0].tool_count);
+        assert!(!captured[1].incremental);
+        assert_eq!(captured[1].previous_response_id, None);
 
         fs::remove_dir_all(workspace).expect("remove workspace");
     }
