@@ -122,7 +122,8 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "bash".to_string(),
-                description: "Run a shell command and stream output to the terminal.".to_string(),
+                description: "Run a shell command and return bounded captured stdout and stderr."
+                    .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {

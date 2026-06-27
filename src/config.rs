@@ -29,6 +29,12 @@ pub struct ModelConfig {
     pub prompt_cache: PromptCacheConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiConfig {
+    pub status_line: bool,
+    pub color: bool,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PromptCacheConfig {
     pub retention: Option<PromptCacheRetention>,
@@ -152,6 +158,43 @@ impl ModelConfig {
     }
 }
 
+impl UiConfig {
+    pub fn from_workspace(workspace_root: &Path) -> Result<Self> {
+        Self::from_workspace_with_env(workspace_root, env_optional)
+    }
+
+    fn from_workspace_with_env(
+        workspace_root: &Path,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let workspace_config = FerrixConfig::load(workspace_root)?;
+        Self::from_parts(workspace_config.ui, env)
+    }
+
+    fn from_parts(
+        workspace_ui: Option<WorkspaceUiConfig>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let workspace_ui = workspace_ui.unwrap_or_default();
+        let status_line = parse_bool_option(
+            "FERRIX_STATUS_LINE",
+            env("FERRIX_STATUS_LINE"),
+            workspace_ui.status_line.or(Some(true)),
+        )?;
+        let color = if env("NO_COLOR").is_some() {
+            false
+        } else {
+            parse_bool_option(
+                "FERRIX_COLOR",
+                env("FERRIX_COLOR"),
+                workspace_ui.color.or(Some(true)),
+            )?
+        };
+
+        Ok(Self { status_line, color })
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OpenRouterConfig {
@@ -171,6 +214,8 @@ pub struct OpenRouterConfig {
 struct FerrixConfig {
     #[serde(default)]
     model: Option<WorkspaceModelConfig>,
+    #[serde(default)]
+    ui: Option<WorkspaceUiConfig>,
 }
 
 impl FerrixConfig {
@@ -231,6 +276,15 @@ struct WorkspacePromptCacheConfig {
     key: Option<String>,
     #[serde(default)]
     store_responses: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceUiConfig {
+    #[serde(default)]
+    status_line: Option<bool>,
+    #[serde(default)]
+    color: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -857,6 +911,62 @@ mod tests {
         .with_prompt_cache_key(Some("session-key".to_string()));
 
         assert_eq!(config.prompt_cache.key.as_deref(), Some("configured"));
+    }
+
+    #[test]
+    fn loads_workspace_ui_config_from_ferrix_config_json() {
+        let workspace = temp_workspace();
+        write_config(
+            &workspace,
+            r#"{
+                "ui": {
+                    "status_line": false,
+                    "color": false
+                }
+            }"#,
+        );
+
+        let config =
+            UiConfig::from_workspace_with_env(&workspace, env_from(&[])).expect("load ui config");
+
+        assert_eq!(
+            config,
+            UiConfig {
+                status_line: false,
+                color: false
+            }
+        );
+    }
+
+    #[test]
+    fn env_overrides_workspace_ui_config() {
+        let workspace = temp_workspace();
+        write_config(
+            &workspace,
+            r#"{
+                "ui": {
+                    "status_line": false,
+                    "color": false
+                }
+            }"#,
+        );
+
+        let config = UiConfig::from_workspace_with_env(
+            &workspace,
+            env_from(&[("FERRIX_STATUS_LINE", "true"), ("FERRIX_COLOR", "true")]),
+        )
+        .expect("load ui config");
+
+        assert!(config.status_line);
+        assert!(config.color);
+    }
+
+    #[test]
+    fn no_color_disables_ui_color() {
+        let config =
+            UiConfig::from_parts(None, env_from(&[("NO_COLOR", "1")])).expect("resolve ui config");
+
+        assert!(!config.color);
     }
 
     #[test]
