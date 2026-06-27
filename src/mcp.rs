@@ -23,6 +23,7 @@ const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct McpRegistry {
     servers: Vec<McpServer>,
     tools: Vec<McpToolEntry>,
+    instructions: Vec<McpServerInstructions>,
 }
 
 impl McpRegistry {
@@ -30,6 +31,7 @@ impl McpRegistry {
         Self {
             servers: Vec::new(),
             tools: Vec::new(),
+            instructions: Vec::new(),
         }
     }
 
@@ -49,8 +51,11 @@ impl McpRegistry {
         let mut registry = Self::empty();
         for server in config.servers.into_iter().filter(|server| !server.disabled) {
             match connect_server(workspace_root, server).await {
-                Ok((server, mut tools)) => {
+                Ok((server, mut tools, instructions)) => {
                     registry.tools.append(&mut tools);
+                    if let Some(instructions) = instructions {
+                        registry.instructions.push(instructions);
+                    }
                     registry.servers.push(server);
                 }
                 Err(error) => {
@@ -65,6 +70,10 @@ impl McpRegistry {
             "mcp registry initialized"
         );
         Ok(registry)
+    }
+
+    pub fn server_instructions(&self) -> &[McpServerInstructions] {
+        &self.instructions
     }
 
     pub fn search(&self, query: &str, limit: Option<usize>) -> McpSearchOutput {
@@ -140,6 +149,7 @@ impl McpRegistry {
         Self {
             servers: Vec::new(),
             tools: tools.into_iter().collect(),
+            instructions: Vec::new(),
         }
     }
 }
@@ -154,6 +164,12 @@ struct McpServer {
 pub struct McpToolEntry {
     server: String,
     tool: Tool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpServerInstructions {
+    pub server: String,
+    pub instructions: String,
 }
 
 impl McpToolEntry {
@@ -306,7 +322,7 @@ struct McpServerConfig {
 async fn connect_server(
     workspace_root: &Path,
     config: McpServerConfig,
-) -> Result<(McpServer, Vec<McpToolEntry>)> {
+) -> Result<(McpServer, Vec<McpToolEntry>, Option<McpServerInstructions>)> {
     let server_name = config.name.clone();
     let transport = TokioChildProcess::new(Command::new(&config.command).configure(|command| {
         command.args(&config.args);
@@ -331,6 +347,10 @@ async fn connect_server(
             )
         })?
         .with_context(|| format!("failed to initialize MCP server `{server_name}`"))?;
+    let instructions = service
+        .peer()
+        .peer_info()
+        .and_then(|info| mcp_server_instructions(&server_name, info.instructions.as_deref()));
     let tools = timeout(MCP_LIST_TOOLS_TIMEOUT, service.peer().list_all_tools())
         .await
         .with_context(|| {
@@ -350,6 +370,7 @@ async fn connect_server(
     info!(
         server = %server_name,
         tool_count = tools.len(),
+        has_instructions = instructions.is_some(),
         "connected MCP server"
     );
 
@@ -359,7 +380,23 @@ async fn connect_server(
             service,
         },
         tools,
+        instructions,
     ))
+}
+
+fn mcp_server_instructions(
+    server: &str,
+    instructions: Option<&str>,
+) -> Option<McpServerInstructions> {
+    let instructions = instructions?.trim();
+    if instructions.is_empty() {
+        return None;
+    }
+
+    Some(McpServerInstructions {
+        server: server.to_string(),
+        instructions: instructions.to_string(),
+    })
 }
 
 fn normalize_call_result(server: &str, tool: &str, result: CallToolResult) -> McpCallOutput {
@@ -478,6 +515,19 @@ mod tests {
 
         assert_eq!(output.matches.len(), 1);
         assert_eq!(output.matches[0].qualified_name, "git/git_status");
+    }
+
+    #[test]
+    fn normalizes_non_empty_server_instructions() {
+        assert_eq!(
+            mcp_server_instructions("docs", Some("  Search before fetching.  ")),
+            Some(McpServerInstructions {
+                server: "docs".to_string(),
+                instructions: "Search before fetching.".to_string(),
+            })
+        );
+        assert_eq!(mcp_server_instructions("docs", Some("   ")), None);
+        assert_eq!(mcp_server_instructions("docs", None), None);
     }
 
     #[test]

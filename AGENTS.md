@@ -42,6 +42,6 @@ Ferrix is a small Rust coding-agent CLI. Keep changes focused on the current sha
 - Prefer small, direct Rust modules over broad abstractions until real duplication appears.
 - Use `anyhow::Context` on fallible IO, HTTP, and serialization paths.
 - Add tests around behavior that can damage files or affect run history, especially filesystem tools and artifact serialization.
-- Run `cargo fmt` and `cargo test` after substantive Rust changes.
+- Run `mise run lint` for linting after substantive Rust changes, and run `cargo test` when behavior changes.
 - When committing, prefer conventional commit subjects and include a short body when the change affects API behavior, configuration, or user-visible CLI behavior.
 - Do not edit `.ferrix/` artifacts into source control; that directory is local runtime state.
